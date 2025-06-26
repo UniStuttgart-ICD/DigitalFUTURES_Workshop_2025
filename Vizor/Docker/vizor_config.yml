@@ -24,7 +24,8 @@ services:
       - stored_motion_path:=/root/catkin_ws/data/stored_plans
       - mongo_db_path:=/root/catkin_ws/data/mongodb
       - production:=false
-      - active:=HOLO1,HOLO2,HOLO3  # define which devices are participating in tasks
+      - physical:=true
+      - active:=HOLO1  # define which devices are participating in tasks
 
   ros-core:
     image: cxy201/noetic-vizor
