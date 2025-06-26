@@ -1,0 +1,31 @@
+[project]
+name = "vizorbridge"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ollama>=0.5.1",
+    "openai>=1.88.0",
+    "openai-agents>=0.0.18",
+    "python-dotenv>=1.0.0",
+    "rich>=14.0.0",
+    "roslibpy>=1.8.1",
+    "smolagents[litellm,openai,telemetry,toolkit]>=1.18.0",
+    "ur-rtde==1.6.0",
+    "websocket>=0.2.1",
+    "websockets>=15.0.1",
+    "fastrtc[stt,tts,vad]>=0.0.28",
+    "twilio>=9.6.3",
+    "pyserial>=3.5",
+    "sounddevice>=0.5.2",
+    "gradio>=5.34.1",
+    "fastapi>=0.115.13",
+    "uvicorn>=0.34.3",
+    "transformers>=4.52.4",
+    "accelerate>=1.8.1",
+    "torch>=2.7.1",
+    "torchaudio>=2.7.1",
+    "textual>=3.5.0",
+    "numpy>=2.2.6",
+]
