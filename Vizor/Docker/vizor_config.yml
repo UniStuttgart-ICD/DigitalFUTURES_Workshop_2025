@@ -1,0 +1,35 @@
+version: '2'
+services:
+  vizor-demo:
+    image: cxy201/noetic-vizor
+    container_name: vizor-demo
+    tty: true        # docker run -t
+    environment:
+      - ROS_HOSTNAME=vizor-demo
+      - ROS_MASTER_URI=http://ros-core:11311
+    ports:
+      - "9090:9090"
+      - "10000:10000" #Unity Port HOLO1
+      - "10001:10001" #Unity Port HOLO2
+      - "10002:10002" #Unity Port HOLO3
+      - "10003:10003" #Unity Port HOLO4
+    depends_on:
+      - ros-core
+    command:
+      - roslaunch
+      - --wait
+      - vizor_package
+      - vizor2ros.launch
+      - task_log_path:=/root/catkin_ws/data/task_logs
+      - stored_motion_path:=/root/catkin_ws/data/stored_plans
+      - mongo_db_path:=/root/catkin_ws/data/mongodb
+      - production:=false
+      - active:=HOLO1,HOLO2,HOLO3  # define which devices are participating in tasks
+
+  ros-core:
+    image: cxy201/noetic-vizor
+    container_name: ros-core
+    ports:
+      - "11311:11311" #Ros Master Port
+    command:
+      - roscore
