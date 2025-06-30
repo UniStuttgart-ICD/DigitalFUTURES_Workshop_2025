@@ -13,6 +13,9 @@ ROS_PORT = 9090
 TASK_EXECUTE_TOPIC = f"/{ROBOT_NAME}/task/execute"
 TASK_EXECUTE_MSG_TYPE = "vizor_package/GeneralTask"
 
+TRAJ_EXECUTE_TOPIC = f"/{ROBOT_NAME}/execute"
+TRAJ_EXECUTE_MSG_TYPE = "trajectory_msgs/JointTrajectory"
+
 COMMAND_TOPIC = f"/{ROBOT_NAME}/command"
 STATUS_TOPIC = "/Robot/status/physical"
 STD_STRING_MSG_TYPE = "std_msgs/String"

@@ -13,7 +13,7 @@ class RobotInterface:
         self.stop = False
         self.client = client
 
-        exec_listener = roslibpy.Topic(self.client, "/UR10/task/execute", "vizor_package/GeneralTaskMsg")
+        exec_listener = roslibpy.Topic(self.client, "/UR10/task/execute", "vizor_package/GeneralTask")
         exec_listener.subscribe(self.execute_trajectory)
 
         command_listener = roslibpy.Topic(self.client, "/UR10/command", "std_msgs/String")
