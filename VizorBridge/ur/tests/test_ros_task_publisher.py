@@ -47,23 +47,24 @@ console = Console()
 # Predefined commands from the PlantUML workflow
 PREDEFINED_COMMANDS = {
     "commands": [
-        "START_FABRICATION",
-        "END_FABRICATION",
+        "start_fabrication",
+        "end_fabrication",
         "stop",
+        "gripper_open",
+        "gripper_close",
+        "home",
     ],
     "status": [
-        "FABRICATION_STARTED",
-        "FABRICATION_COMPLETE",
-        "SUCCESS_CheckElements",
-        "SUCCESS_ManualPlacement_FirstTwo",
-        "SUCCESS_PickUp_40",
-        "SUCCESS_PlaceHold_40", 
-        "SUCCESS_ReturnHome_40",
-        "MOVING_TO_SUPPLY",
-        "GRIPPER_OPEN",
-        "GRIPPER_CLOSE",
-        "AT_ASSEMBLY",
-        "COMPLETE_ADJUST_POSITION"
+        "success",
+        "failed",
+        "stop",
+        "fabrication_started",
+        "fabrication_complete",
+        "moving_to_supply",
+        "gripper_open",
+        "gripper_close",
+        "at_assembly",
+        "complete_adjust_position"
     ]
 }
 
@@ -104,9 +105,9 @@ def display_main_menu() -> str:
     table.add_column("Option", style="cyan")
     table.add_column("Description", style="green")
     
-    table.add_row("1", "Publish Task Message", "Send YAML task files to /UR10/task/execute")
-    table.add_row("2", "Publish Command", "Send command strings to /UR10/command")
-    table.add_row("3", "Publish Status", "Send status strings to /Robot/status/physical")
+    table.add_row("1", "Publish Task Message", f"Send YAML task files to {TASK_EXECUTE_TOPIC}")
+    table.add_row("2", "Publish Command", f"Send command strings to {COMMAND_TOPIC}")
+    table.add_row("3", "Publish Status", f"Send status strings to {STATUS_TOPIC}")
     table.add_row("q", "Quit", "Exit the publisher")
     
     console.print(table)
@@ -200,7 +201,7 @@ def display_command_selection(command_type: str) -> str:
             description = "End fabrication process"
         elif "SUCCESS" in cmd:
             description = "Task completion status"
-        elif "GRIPPER" in cmd:
+        elif "GRIPPER" in cmd.upper():
             description = "Gripper state change"
         elif "MOVING" in cmd:
             description = "Robot movement status"

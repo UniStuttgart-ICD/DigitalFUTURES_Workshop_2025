@@ -22,6 +22,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+
+def _timestamp() -> str:
+    """Generate a timestamp string for print statements."""
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
 import websockets
 
 # Add project root to path to allow imports from other modules
@@ -30,14 +35,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from ur.agents.base_agent import BaseVoiceAgent
 from ur.config.voice_config import VoiceAgentConfig, load_config_from_env
 from ur.agents.voice_common.status import VoiceAgentStatus
-from ur.agents.voice_common.audio import create_audio_callback, encode_audio_for_openai, AUDIO_CONFIG
+from ur.agents.voice_common.audio import create_audio_callback, encode_audio_for_openai, AUDIO_CONFIG, play_audio
 from ur.tools import register_tools_for_openai
-from ur.agents.shared_prompts import get_system_prompt
+from ur.config.system_prompts import get_system_prompt, build_commentary_prompt
 from ur.config.system_config import (
     OPENAI_MODEL_ID,
     OPENAI_TRANSCRIPTION_MODEL,
     TOOL_EXECUTOR_MAX_WORKERS,
-    SESSION_ID_PREFIX
+    SESSION_ID_PREFIX,
+    COMMAND_END
 )
 from ur.config.voice_config import (
     OPENAI_INPUT_AUDIO_FORMAT,
@@ -48,11 +54,17 @@ from ur.config.robot_config import (
     ROBOT_AGENT_UI_NAME,
     ROBOT_TOOL_THREAD_PREFIX
 )
-from ur.config.system_prompts import build_enhanced_instructions
+from ur.config.system_prompts import OPENAI_VOICE_INSTRUCTIONS
+from ur.agents.voice_common.silero_vad import SileroVADProcessor
 
 # Optional audio imports
 try:
     import openai
+except ImportError:
+    raise ImportError("openai is required for voice agent")
+
+# Audio and numeric dependencies (optional)
+try:
     import numpy as np
     import sounddevice as sd
     AUDIO_AVAILABLE = True
@@ -125,6 +137,7 @@ class RealtimeAgent:
         
         # Internal state
         self._tool_map = {tool.name: tool for tool in self.tools}
+        self.config = config
         
     def add_tool(self, tool: ToolDefinition):
         """Add a tool to the agent."""
@@ -133,25 +146,28 @@ class RealtimeAgent:
         
     def get_session_config(self) -> Dict[str, Any]:
         """Get session configuration for the Realtime API."""
-        return {
-            "modalities": ["audio", "text"],
+        cfg = {
+            "modalities": ["audio", "text"] if self.config.enable_hybrid_mode else ["audio"],
             "instructions": self.instructions,
             "voice": self.voice,
+            "speed": self.config.openai_voice_speed,
             "input_audio_format": OPENAI_INPUT_AUDIO_FORMAT,
             "output_audio_format": OPENAI_OUTPUT_AUDIO_FORMAT,
-            "input_audio_transcription": {
-                "model": OPENAI_TRANSCRIPTION_MODEL
-            },
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.4,  # Default VAD threshold (configurable via VAD_THRESHOLD env var)
-                "prefix_padding_ms": 200,  # Default padding (configurable via VAD_PREFIX_PADDING_MS env var)
-                "silence_duration_ms": 500,  # Default silence duration (configurable via VAD_SILENCE_DURATION_MS env var)
-                "create_response": True
-            },
             "tools": [self._convert_tool_to_openai_spec(tool) for tool in self.tools],
-            "temperature": self.temperature
+            "temperature": self.temperature,
+            "tool_choice": "auto"
         }
+        # Configure turn detection: server-side VAD if enabled, otherwise defer to client VAD
+        if self.config.openai_use_server_vad:
+            cfg["turn_detection"] = {
+                "type": "server_vad",
+                "create_response": True,
+                "interrupt_response": True,
+                "silence_duration_ms": self.config.vad_silence_duration_ms,
+                "prefix_padding_ms": self.config.vad_prefix_padding_ms,
+            }
+            # Force the model to invoke tools for applicable operations
+        return cfg
         
     def _convert_tool_to_openai_spec(self, tool: ToolDefinition) -> Dict[str, Any]:
         """Convert tool definition to OpenAI API specification."""
@@ -184,8 +200,8 @@ class RealtimeSession:
         # Session logging
         self.session_id = f"session_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         
-        # WebSocket connection
-        self.client = openai.AsyncOpenAI(api_key=api_key)
+        # WebSocket connection client will be created once under the session's event loop
+        self.client = None
         self.connection = None
         self.connection_manager = None  # Initialize connection manager
         
@@ -229,6 +245,9 @@ class RealtimeSession:
         # Tool call deduplication tracking
         self.processed_tool_calls = set()  # Track processed call_ids to prevent duplicates
         self._active_response = False  # Track if we have an active response to prevent conflicts
+        
+        # Audio buffer tracking for preventing empty flushes
+        self._audio_chunks_buffered = 0
     
     def on(self, event_type: EventType, handler: Callable):
         """Register an event handler."""
@@ -247,7 +266,7 @@ class RealtimeSession:
                     else:
                         handler(event)
                 except Exception as e:
-                    print(f"❌ Event handler error: {e}")
+                    print(f"[{_timestamp()}] ❌ Event handler error: {e}")
     
     def _setup_default_handlers(self):
         """Setup default event handlers."""
@@ -275,20 +294,13 @@ class RealtimeSession:
             if self.config.debug_mode:
                 self.status.print_message("🎤 Microphone unmuted", "dim")
 
-    def _convert_tool_to_openai_spec(self, tool: ToolDefinition) -> Dict[str, Any]:
-        """Convert tool definition to OpenAI API specification."""
-        return {
-            "type": "function",
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters
-        }
-
     async def connect(self):
         """Connect to OpenAI Realtime API using the official SDK."""
         self.status.update_status("Connecting to OpenAI Realtime API...")
-        
-        # Store the connection manager for later use in start_session
+        # Instantiate the AsyncOpenAI client under the current event loop
+        import openai as _openai
+        self.client = _openai.AsyncOpenAI(api_key=self.api_key)
+        # Prepare the realtime connection manager
         self.connection_manager = self.client.beta.realtime.connect(model=self.agent.model)
         
         self.status.print_success("Ready to connect to OpenAI Realtime API")
@@ -315,7 +327,7 @@ class RealtimeSession:
                 if self.config.text_only_mode:
                     self.status.update_status("Text mode ready - type your messages!")
                     self.status.print_message("💬 Text-only mode enabled. Type messages and press Enter.", "cyan")
-                elif self.config.enable_text_input:
+                elif self.config.enable_hybrid_mode:
                     self.status.update_status("Hybrid mode ready - speak OR type!")
                     self.status.print_message("🎤💬 Hybrid mode: You can speak OR type messages (press Enter to send).", "cyan")
                 else:
@@ -327,19 +339,27 @@ class RealtimeSession:
 
                 # Start concurrent tasks: event handling + input streams
                 event_task = asyncio.create_task(self._handle_server_events())
-                input_tasks = []
+                tasks = [event_task]
 
-                if self.config.enable_text_input or self.config.text_only_mode:
-                    input_tasks.append(asyncio.create_task(self._text_input_stream_impl()))
-
-                if not self.config.text_only_mode and AUDIO_AVAILABLE:
-                    input_tasks.append(asyncio.create_task(self._audio_input_stream_impl()))
+                if self.config.enable_hybrid_mode:
+                    # Hybrid: both text & audio streams
+                    tasks.append(asyncio.create_task(self._text_input_stream_impl()))
+                    if AUDIO_AVAILABLE:
+                        tasks.append(asyncio.create_task(self._audio_input_stream_impl()))
+                    else:
+                        self.status.print_message("🔇 Audio input not available", "yellow")
                 elif self.config.text_only_mode:
-                    self.status.print_message("🔇 Voice input disabled (text-only mode)", "yellow")
+                    # Text-only
+                    tasks.append(asyncio.create_task(self._text_input_stream_impl()))
+                else:
+                    # Audio-only
+                    if AUDIO_AVAILABLE:
+                        tasks.append(asyncio.create_task(self._audio_input_stream_impl()))
+                    else:
+                        self.status.print_message("🔇 Voice input disabled (text-only mode)", "yellow")
 
-                tasks_to_wait = [event_task] + input_tasks
-                if tasks_to_wait:
-                    await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+                # Await both event loop and input streams
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             self.status.print_error(f"Session error: {e}")
@@ -357,26 +377,9 @@ class RealtimeSession:
         
         # Use the session.update method as shown in the Python examples
         try:
-            await self.connection.session.update(
-                session={
-                    "instructions": self.agent.instructions,
-                    "voice": self.agent.voice,
-                    "input_audio_format": OPENAI_INPUT_AUDIO_FORMAT,
-                    "output_audio_format": OPENAI_OUTPUT_AUDIO_FORMAT,
-                    "input_audio_transcription": {
-                        "model": OPENAI_TRANSCRIPTION_MODEL
-                    },
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": self.config.vad_threshold,  # Configurable VAD sensitivity
-                        "prefix_padding_ms": self.config.vad_prefix_padding_ms,  # Configurable padding
-                        "silence_duration_ms": self.config.vad_silence_duration_ms,  # Configurable silence duration
-                        "create_response": True
-                    },
-                    "tools": [self._convert_tool_to_openai_spec(tool) for tool in self.agent.tools],
-                    "temperature": self.agent.temperature
-                }
-            )
+            # Use agent helper to build session config
+            session_config = self.agent.get_session_config()
+            await self.connection.session.update(session=session_config)
             
             self.status.update_status("Session configured - ready to chat!")
             self.status.print_success("Session configured with agent settings")
@@ -401,19 +404,15 @@ class RealtimeSession:
             return
             
         try:
-            # Use the send method to create a conversation item and trigger response
-            await self.connection.send({
-                "type": "conversation.item.create",
-                "item": {
+            # Use SDK helpers to send the user message and trigger response
+            await self.connection.conversation.item.create(
+                item={
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": text}]
-                        }
-            })
-            
-            # Trigger response
-            await self.connection.send({"type": "response.create"})
-            
+                }
+            )
+            await self.connection.response.create()
         except Exception as e:
             self.status.print_error(f"Failed to send message: {e}")
 
@@ -443,15 +442,15 @@ class RealtimeSession:
         # Debug output for important events if enabled
         if self.config.debug_mode:
             if "function" in event_type or "tool" in event_type:
-                print(f"🚨 FUNCTION/TOOL EVENT: {event_type} - {event}")
+                print(f"[{_timestamp()}] 🚨 FUNCTION/TOOL EVENT: {event_type} - {event}")
             elif event_type == "response.audio.delta":
-                print(f"🚨 AUDIO DELTA: {event_type} (audio data: {len(str(getattr(event, 'delta', ''))) if hasattr(event, 'delta') else 'N/A'} bytes)")
+                print(f"[{_timestamp()}] 🚨 AUDIO DELTA: {event_type} (audio data: {len(str(getattr(event, 'delta', ''))) if hasattr(event, 'delta') else 'N/A'} bytes)")
             elif "response" in event_type:
-                print(f"🚨 RESPONSE EVENT: {event_type}")
+                print(f"[{_timestamp()}] 🚨 RESPONSE EVENT: {event_type}")
             elif "conversation" in event_type:
-                print(f"🚨 CONVERSATION EVENT: {event_type} - {event}")
+                print(f"[{_timestamp()}] 🚨 CONVERSATION EVENT: {event_type} - {event}")
             else:
-                print(f"🔍 DEBUG EVENT: {event_type}")
+                print(f"[{_timestamp()}] 🔍 DEBUG EVENT: {event_type}")
         
         try:
             if event_type == "session.created":
@@ -493,21 +492,18 @@ class RealtimeSession:
                 self.audio_output_buffer.extend(audio_data)
                 
             elif event_type == "response.audio.done":
-                if self.audio_output_buffer:
-                    await self._play_audio_response(bytes(self.audio_output_buffer))
-                    self.audio_output_buffer = bytearray()
-                    
+                # buffered for later playback
+                pass
+                
             elif event_type == "response.text.delta":
                 text_delta = getattr(event, 'delta', "")
                 self.text_response_buffer += text_delta
                 self.is_receiving_text = True
                 
             elif event_type == "response.text.done":
-                if self.text_response_buffer:
-                    self.status.print_message(f"🤖 Assistant: {self.text_response_buffer}", "blue bold")
-                    self.text_response_buffer = ""
+                # completed text streaming; will display in _handle_response_completed
                 self.is_receiving_text = False
-                    
+                
             elif event_type == "response.audio_transcript.delta":
                 transcript_delta = getattr(event, 'delta', "")
                 self.audio_transcript_buffer += transcript_delta
@@ -521,7 +517,7 @@ class RealtimeSession:
             elif event_type == "response.output_item.done":
                 if hasattr(event, 'item') and hasattr(event.item, 'type') and event.item.type == "function_call":
                     if self.config.debug_mode:
-                        print(f"🚨 FUNCTION CALL DETECTED: {event}")
+                        print(f"[{_timestamp()}] 🚨 FUNCTION CALL DETECTED: {event}")
                     # Extract function call data properly from the Python SDK event
                     item_data = event.item.model_dump()
                     self._emit_event(EventType.TOOL_CALL_REQUESTED, {
@@ -531,7 +527,7 @@ class RealtimeSession:
                         "source_event": "response.output_item.done"
                     })
                 elif self.config.debug_mode and hasattr(event, 'item'):
-                    print(f"🔍 Response item completed: {event.item.type if hasattr(event.item, 'type') else 'unknown'}")
+                    print(f"[{_timestamp()}] 🔍 Response item completed: {event.item.type if hasattr(event.item, 'type') else 'unknown'}")
                 
             elif event_type == "response.done":
                 self._emit_event(EventType.RESPONSE_COMPLETED, event.model_dump())
@@ -551,13 +547,24 @@ class RealtimeSession:
                     
                         self._emit_event(EventType.ERROR, event.model_dump())
                 
+            elif event_type == "task_starting":
+                # Task execution starting: announce movement
+                commentary = self._generate_task_starting_commentary(event.model_dump())
+            elif event_type == "command_received":
+                # Handle command received event
+                prompt = build_commentary_prompt(
+                    context_type='command',
+                    command=event.model_dump().get('command')
+                )
+                commentary = await self._prompt_llm_for_commentary(prompt)
+                
             else:
                 # Optional logging for unknown event types
                 if self.config.debug_mode:
-                    print(f"🔍 Unknown event type: {event_type}")
+                    print(f"[{_timestamp()}] 🔍 Unknown event type: {event_type}")
                 
         except Exception as e:
-            print(f"❌ Error processing event {event_type}: {e}")
+            print(f"[{_timestamp()}] ❌ Error processing event {event_type}: {e}")
             if self.config.debug_mode:
                 import traceback
                 traceback.print_exc()
@@ -625,6 +632,14 @@ class RealtimeSession:
         transcript = event.data.get("transcript", "")
         self.status.print_user_message(transcript)
         
+        # Special handling: if user says stop or stop fabrication, trigger end_fabrication
+        lower = transcript.lower().strip()
+        if lower in ['stop', 'stop fabrication', 'end fabrication']:
+            self.status.print_message("👋 Stop command received, ending fabrication...", "yellow")
+            if self.bridge:
+                self.bridge.process_command({'data': COMMAND_END})
+            return
+        
     async def _handle_response_started(self, event: RealtimeEvent):
         """Handle response start."""
         self.status.set_processing(False)
@@ -635,12 +650,14 @@ class RealtimeSession:
         # Log session event
         self._log_event("response_completed", {"content": self.text_response_buffer})
         
-        # Play audio if available
+        # On completion, play audio if available, otherwise display text
         if self.audio_output_buffer and not self.config.text_only_mode and AUDIO_AVAILABLE:
             await self._play_audio_response(bytes(self.audio_output_buffer))
+        elif self.text_response_buffer:
+            self.status.print_message(self.text_response_buffer, "cyan")
 
         # Reset buffers after processing
-        self.audio_output_buffer = bytearray()
+        self.audio_output_buffer.clear()
         self.text_response_buffer = ""
         self.is_receiving_text = False
         
@@ -666,15 +683,15 @@ class RealtimeSession:
     async def _handle_tool_call(self, event: RealtimeEvent):
         """Handle tool call execution with deduplication and improved parsing."""
         if self.config.debug_mode:
-            print(f"🚨 TOOL CALL HANDLER TRIGGERED! Event: {event}")
-            print(f"🔧 Tool call event data: {event.data}")
+            print(f"[{_timestamp()}] 🚨 TOOL CALL HANDLER TRIGGERED! Event: {event}")
+            print(f"[{_timestamp()}] 🔧 Tool call event data: {event.data}")
         
         try:
             event_data = event.data
             
             if self.config.debug_mode:
-                print(f"🔧 Processing event data: {event_data}")
-                print(f"🔧 Available keys: {list(event_data.keys()) if isinstance(event_data, dict) else 'Not a dict'}")
+                print(f"[{_timestamp()}] 🔧 Processing event data: {event_data}")
+                print(f"[{_timestamp()}] 🔧 Available keys: {list(event_data.keys()) if isinstance(event_data, dict) else 'Not a dict'}")
             
             # Extract function call information - use improved direct extraction
             function_name = event_data.get("name")
@@ -682,17 +699,17 @@ class RealtimeSession:
             call_id = event_data.get("call_id")
             
             if self.config.debug_mode:
-                print(f"🔧 Extracted: name={function_name}, args={arguments_str}, call_id={call_id}")
+                print(f"[{_timestamp()}] 🔧 Extracted: name={function_name}, args={arguments_str}, call_id={call_id}")
             
             if not function_name or not call_id:
                 if self.config.debug_mode:
-                    print(f"⚠️ Skipping invalid function call - missing name ({function_name}) or call_id ({call_id})")
+                    print(f"[{_timestamp()}] ⚠️ Skipping invalid function call - missing name ({function_name}) or call_id ({call_id})")
                 return
                 
             # Deduplication check
             if call_id in self.processed_tool_calls:
                 if self.config.debug_mode:
-                    print(f"🔄 Skipping duplicate tool call: {call_id}")
+                    print(f"[{_timestamp()}] 🔄 Skipping duplicate tool call: {call_id}")
                 return
             
             # Mark as processed to prevent duplicates
@@ -709,14 +726,14 @@ class RealtimeSession:
                 # Parse arguments
                 args = json.loads(arguments_str) if arguments_str else {}
                 if self.config.debug_mode:
-                    print(f"🤖 Executing: {function_name}({args})")
+                    print(f"[{_timestamp()}] 🤖 Executing: {function_name}({args})")
                 
                 # Execute the tool
                 result = await self._execute_tool(tool, args)
                 if self.config.debug_mode:
-                    print(f"✅ Tool execution result: {result}")
+                    print(f"[{_timestamp()}] ✅ Tool execution result: {result}")
                 
-                # Send function result back using the correct Python SDK method
+                # Send function result using SDK helpers
                 await self.connection.conversation.item.create(
                     item={
                         "type": "function_call_output",
@@ -724,8 +741,6 @@ class RealtimeSession:
                         "output": json.dumps(result)
                     }
                 )
-                
-                # Trigger response after successful tool execution
                 await self.connection.response.create()
                 
             except json.JSONDecodeError as e:
@@ -778,9 +793,9 @@ class RealtimeSession:
         """Send tool execution error back to the API."""
         try:
             if self.config.debug_mode:
-                print(f"⚠️ Sending tool error for call_id {call_id}: {error_message}")
+                print(f"[{_timestamp()}] ⚠️ Sending tool error for call_id {call_id}: {error_message}")
                 
-            # Use the correct Python SDK method to create a function call output
+            # Send error output using SDK helpers
             await self.connection.conversation.item.create(
                 item={
                     "type": "function_call_output",
@@ -788,8 +803,6 @@ class RealtimeSession:
                     "output": json.dumps({"error": error_message})
                 }
             )
-            
-            # Trigger response after sending error
             await self.connection.response.create()
             
         except Exception as e:
@@ -801,6 +814,22 @@ class RealtimeSession:
             self.audio_interrupt_event.set()
             if self.config.debug_mode:
                 self.status.print_message("Audio interrupt event set", "dim")
+
+    async def flush_audio_buffer(self):
+        """Manually flush the audio buffer to the server."""
+        if self.is_connected and self.connection:
+            # Only flush if we have buffered some audio chunks
+            if self._audio_chunks_buffered < 5:  # Need at least 5 chunks (~100ms) before flushing
+                if self.config.debug_mode:
+                    self.status.print_message(f"🚫 Skipping flush: only {self._audio_chunks_buffered} chunks buffered", "dim")
+                return
+                
+            try:
+                await self._send_event({"type": "input_audio_buffer.commit"})
+                self.status.print_message(f"🎤 Manually triggered send to server ({self._audio_chunks_buffered} chunks).", "yellow")
+                self._audio_chunks_buffered = 0  # Reset counter after flush
+            except Exception as e:
+                self.status.print_error(f"Failed to flush audio buffer: {e}")
 
     async def _play_audio_response(self, audio_data: bytes):
         """Play the audio response from the assistant."""
@@ -833,12 +862,14 @@ class RealtimeSession:
             # Get selected output device from config if available
             output_device = getattr(self.config, 'selected_output_device', None)
             
-            # Play the audio
-            sd.play(audio_float, samplerate=AUDIO_CONFIG['samplerate'], device=output_device)
-            sd.wait()  # Wait for playback to complete
-            
+            # Play back the received PCM audio_data directly
+            import sounddevice as _sd
+            # Play normalized float32 audio buffer
+            _sd.play(audio_float, AUDIO_CONFIG['samplerate'], device=output_device)
+            _sd.wait()
+
         except Exception as e:
-            print(f"❌ Audio playback failed: {e}")
+            print(f"[{_timestamp()}] ❌ Audio playback failed: {e}")
             if self.config.debug_mode:
                 import traceback
                 traceback.print_exc()
@@ -850,7 +881,6 @@ class RealtimeSession:
             
             # After speaking, go back to listening
             if not self.config.text_only_mode:
-                print("🎤 Started listening...")
                 self.status.set_listening(True)
 
     async def _text_input_stream_impl(self):
@@ -861,11 +891,12 @@ class RealtimeSession:
         
         try:
             self.status.print_message("💬 Text input ready! Type your message and press Enter...", "green")
-            self.status.print_message("💡 Commands: 'quit' to exit text mode, Ctrl+C to stop completely", "cyan")
+            self.status.print_message("💡 Press [Enter] to manually send audio. Type 'quit' to exit, or Ctrl+C to stop.", "cyan")
+            self.status.update_status("ready_to_accept_tasks")
             
             while self.is_connected and not self.should_stop:
                 try:
-                    print("\n💬 Type message: ", end="", flush=True)
+                    print(f"\n[{_timestamp()}] 💬 Type message (or press Enter to send audio): ", end="", flush=True)
                     text_input = await loop.run_in_executor(
                         None, 
                         lambda: sys.stdin.readline().strip()
@@ -878,10 +909,11 @@ class RealtimeSession:
                     continue
 
                 if not text_input:
+                    await self.flush_audio_buffer()
                     continue
                         
                 if text_input.lower() in ['quit', 'exit', 'q']:
-                    self.status.print_message("👋 Text input stopped", "yellow")
+                    self.status.print_message("\n👋 Text input stopped", "yellow")
                     break
                         
                 # Show user's message
@@ -905,6 +937,13 @@ class RealtimeSession:
             return
             
         self.status.update_status("Voice input active - start speaking!")
+        
+        # Setup Silero VAD processor for accurate speech detection
+        vad_processor = SileroVADProcessor(
+            threshold=self.config.silero_vad_threshold,
+            min_speech_duration_ms=self.config.silero_min_speech_duration_ms,
+            min_silence_duration_ms=self.config.silero_min_silence_duration_ms,
+        )
         
         try:
             # Setup audio queue
@@ -935,10 +974,36 @@ class RealtimeSession:
                     try:
                         chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
 
+                        # Process with Silero VAD - convert bytes to int16 numpy array
+                        audio_array = np.frombuffer(chunk, dtype=np.int16)
+                        
+                        # Process with Silero VAD
+                        vad_result = vad_processor.process_audio_chunk(
+                            audio_array, 
+                            AUDIO_CONFIG["samplerate"]
+                        )
+                        
+                        # Handle VAD events with detailed logging
+                        if vad_result['speech_detected']:
+                            if self.config.debug_mode:
+                                self.status.print_message(f"🎤 Speech started (prob={vad_result['speech_probability']:.3f})", "green")
+                            
+                        if vad_result['speech_ended']:
+                            if self.config.debug_mode:
+                                self.status.print_message(f"🔈 Speech ended (prob={vad_result['speech_probability']:.3f}), requesting flush...", "yellow")
+                            # Trigger the same behavior as before
+                            self._trigger_speech_ended()
+                        
+                        # Log high probability silence that might be triggering false positives
+                        elif self.config.debug_mode and vad_result['speech_probability'] > 0.3:
+                            if chunks_sent % 50 == 0:  # Don't spam, log occasionally
+                                self.status.print_message(f"🔇 Silence but prob={vad_result['speech_probability']:.3f}", "dim")
+
                         # Use the SDK's method to append audio
                         if self.connection:
                             # Audio chunk is already in bytes format from the callback
                             await self.connection.input_audio_buffer.append(audio=base64.b64encode(chunk).decode("utf-8"))
+                            self._audio_chunks_buffered += 1  # Track audio chunks for flush guard
 
                         chunks_sent += 1
 
@@ -963,7 +1028,29 @@ class RealtimeSession:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             log_entry = {"time": timestamp, "event": event_type, "details": details}
             # For now, just print to console or you could write to a file/db
-            print(f"📝 LOG {log_entry}")
+            print(f"[{_timestamp()}] 📝 LOG {log_entry}")
+
+    def _trigger_speech_ended(self):
+        """Handle speech end detection - replaces the old _on_speech_paused callback."""
+        # Immediately switch to processing state for UI
+        self.status.set_listening(False)
+        self.status.set_processing(True)
+        self.status.update_status("Processing your speech...")
+        
+        # Flush buffered audio to server
+        asyncio.get_event_loop().create_task(self.flush_audio_buffer())
+
+    def _generate_task_starting_commentary(self, event_data: dict) -> str:
+        """Generate commentary when task execution begins."""
+        task_name = event_data.get('task_name', 'Unknown')
+        if 'pickup' in task_name.lower():
+            return "Moving to pick up beam."
+        elif 'place' in task_name.lower():
+            return "Moving to assembly position."
+        elif 'home' in task_name.lower():
+            return "Beam secured. I'm returning to the home position."
+        else:
+            return f"Starting {task_name}."
 
 def _generate_dynamic_tool_list(function_map: Dict[str, Callable]) -> dict:
     """Generate tool list dynamically from actual available tools."""
@@ -982,7 +1069,7 @@ def _generate_dynamic_tool_list(function_map: Dict[str, Callable]) -> dict:
         }
         
         if requires_wake:
-            tool_info["requires"] = "wake_phrase with 'timbra'"
+            tool_info["requires"] = "wake_phrase with 'mave'"
         
         available_tools.append(tool_info)
     
@@ -990,7 +1077,7 @@ def _generate_dynamic_tool_list(function_map: Dict[str, Callable]) -> dict:
         "status": "success",
         "available_tools": available_tools,
         "total_tools": len(available_tools),
-        "safety_note": "Most movement tools require the wake word 'timbra' for safety"
+        "safety_note": "Most movement tools require the wake word 'mave' for safety"
     }
 
 
@@ -1023,7 +1110,7 @@ def create_robot_tools() -> List[ToolDefinition]:
         tools.append(list_tools_tool)
         
     except Exception as e:
-        print(f"❌ ERROR with auto-discovery: {e}")
+        print(f"[{_timestamp()}] ❌ ERROR with auto-discovery: {e}")
         return []
         
     return tools
@@ -1037,26 +1124,25 @@ def create_robot_agent(config: Optional[VoiceAgentConfig] = None) -> RealtimeAge
         system_prompt = get_system_prompt("voice")
     except Exception as e:
         if config.debug_mode:
-            print(f"❌ ERROR getting system prompt: {e}")
+            print(f"[{_timestamp()}] ❌ ERROR getting system prompt: {e}")
         system_prompt = "You are a robot control assistant."
     
-    enhanced_instructions = build_enhanced_instructions(system_prompt)
     
     # Create tools
     try:
         robot_tools = create_robot_tools()
         if config.debug_mode:
-            print(f"🚨 CREATED {len(robot_tools)} ROBOT TOOLS")
+            print(f"[{_timestamp()}] 🚨 CREATED {len(robot_tools)} ROBOT TOOLS")
     except Exception as e:
         if config.debug_mode:
-            print(f"❌ ERROR creating robot tools: {e}")
+            print(f"[{_timestamp()}] ❌ ERROR creating robot tools: {e}")
         robot_tools = []
     
     # Create agent with robot tools (use OPENAI_MODEL_ID from .env or fallback to default)
     openai_model = OPENAI_MODEL_ID
     agent = RealtimeAgent(
         name=ROBOT_AGENT_NAME,
-        instructions=enhanced_instructions,
+        instructions=f"{system_prompt} + {OPENAI_VOICE_INSTRUCTIONS}",
         tools=robot_tools,
         voice=config.openai_voice,
         temperature=config.openai_temperature,
@@ -1082,22 +1168,36 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
         self.should_stop = False
 
     async def start(self):
-        """Starts the enhanced OpenAI voice agent session."""
-        # Use the shared status system
-        self.ui = VoiceAgentStatus(ROBOT_AGENT_UI_NAME)
-        self.ui.start_live_display()
-        self.ui.update_status("Creating agent specification...")
+        """Starts the enhanced OpenAI voice agent session, including agent-driven startup and goodbye speech."""
+        # UI for session is managed by the realtime session; skip agent UI startup
 
-        # Create enhanced agent
+        # Create agent and session
         agent = create_robot_agent(self.config)
         self.session = RealtimeSession(agent, self.api_key, self.bridge, self.config)
 
         try:
+            # Connect to Realtime API
             await self.session.connect()
-            await self.start_session()
+
+            # Agent-driven welcome message
+            start_msg = await self.generate_fabrication_message("start")
+            if start_msg:
+                await self.session.send_message(start_msg)
+
+            # Enter main streaming loop
+            await self.session.start_session_with_connection()
+
         except Exception as e:
             self.ui.print_error(f"Failed to start OpenAI session: {e}")
         finally:
+            # Agent-driven goodbye message
+            try:
+                end_msg = await self.generate_fabrication_message("end")
+                if end_msg and self.session and self.session.is_connected:
+                    await self.session.send_message(end_msg)
+            except Exception:
+                pass
+            # Clean up
             await self.stop()
 
     async def stop(self):
@@ -1128,14 +1228,16 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
         # Stop UI display with complete shutdown
         if self.ui:
             try:
-                if hasattr(self.ui, 'complete_shutdown'):
+                if hasattr(self.ui, 'force_shutdown'):
+                    self.ui.force_shutdown()  # Use force shutdown method
+                elif hasattr(self.ui, 'complete_shutdown'):
                     self.ui.complete_shutdown()  # Use aggressive shutdown method
                 else:
                     # Fallback to regular stop method
                     self.ui.stop_live_display()
                 self.ui.print_message("OpenAI session stopped.", "yellow")
             except Exception as e:
-                print(f"⚠️ UI shutdown error: {e}")
+                print(f"[{_timestamp()}] ⚠️ UI shutdown error: {e}")
                 # Force basic stop
                 if hasattr(self.ui, 'is_stopped'):
                     self.ui.is_stopped = True
@@ -1162,7 +1264,7 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
                 except Exception as e:
                     # Ignore connection errors during shutdown
                     if self.config.debug_mode:
-                        print(f"Warning: Session close error during shutdown: {e}")
+                        print(f"[{_timestamp()}] Warning: Session close error during shutdown: {e}")
 
     def _text_input_stream(self):
         """Handle keyboard text input alongside voice input - method needs to be defined in parent class."""
@@ -1183,21 +1285,23 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
         try:
             from ur.config.system_prompts import build_commentary_prompt
             
-            # Generate appropriate commentary using system prompts
+            # Generate appropriate commentary using system prompts or custom directives
             if event_type == 'task_received':
+                # Use the standardized commentary prompt for task announcements
                 prompt = build_commentary_prompt(
                     context_type='task_execute',
                     task_name=event_data.get('task_name')
                 )
                 commentary = await self._prompt_llm_for_commentary(prompt)
-                
+            elif event_type == 'task_starting':
+                # Task execution starting: announce movement
+                commentary = self._generate_task_starting_commentary(event_data)
             elif event_type == 'command_received':
                 prompt = build_commentary_prompt(
                     context_type='command',
                     command=event_data.get('command')
                 )
                 commentary = await self._prompt_llm_for_commentary(prompt)
-                
             elif event_type == 'robot_action':
                 prompt = build_commentary_prompt(
                     context_type='task_execute',
@@ -1205,29 +1309,82 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
                     action_type=event_data.get('action_type')
                 )
                 commentary = await self._prompt_llm_for_commentary(prompt)
-                
             else:
                 # Fallback for other event types
                 commentary = f"Processing {event_type}..."
             
             # Send the generated commentary
             if commentary and commentary.strip():
-                await self.session.send_message(commentary)
-                if self.config.debug_mode:
-                    print(f"🎭 [LLM COMMENTARY] {event_type}: {commentary}")
-                    
+                await self.speak_commentary(commentary)
+
         except Exception as e:
             if self.config.debug_mode:
-                print(f"❌ [COMMENTARY ERROR] {event_type}: {e}")
+                print(f"[{_timestamp()}] ❌ [COMMENTARY ERROR] {event_type}: {e}")
+
+    async def speak_commentary(self, text: str):
+        """Generates and speaks commentary without sending it as a user message."""
+        # Skip if commentary TTS is disabled or no session/context
+        if not text or not self.session or not self.config.enable_commentary_tts:
+            return
+
+        if self.config.debug_mode:
+            print(f"[{_timestamp()}] 🎤 [ASSISTANT SPEAKING] {text}")
+
+        try:
+            # Mute microphone and update UI status for commentary TTS
+            # Block audio input by marking session as speaking
+            self.session.is_speaking = True
+            self.session.status.set_listening(False)
+            self.session.status.set_speaking(True)
+
+            # Interrupt any current response
+            await self.session.interrupt_audio()
+
+            # Get OpenAI client
+            client = getattr(self.session, 'client', None)
+            if client is None:
+                import openai as _openai
+                client = _openai.AsyncOpenAI(api_key=self.api_key)
+
+            # Synchronously fetch the full WAV bytes and play them
+            resp = await client.audio.speech.create(
+                model="tts-1",
+                voice=self.session.agent.voice,
+                input=text,
+                response_format='wav',
+                speed=self.config.openai_voice_speed,
+                instructions=self.session.agent.instructions,
+            )
+            audio_bytes = resp.content
+            # Decode WAV bytes and play via sounddevice
+            import io, wave
+            wav_buffer = io.BytesIO(audio_bytes)
+            with wave.open(wav_buffer, 'rb') as wav_file:
+                frames = wav_file.readframes(-1)
+                audio_array = np.frombuffer(frames, dtype=np.int16)
+                audio_float = audio_array.astype(np.float32) / 32768.0
+                import sounddevice as _sd
+                _sd.play(audio_float, wav_file.getframerate())
+                _sd.wait()
+
+        except Exception as e:
+            if self.config.debug_mode:
+                print(f"[{_timestamp()}] ❌ [TTS ERROR] Failed to speak commentary: {e}")
+        finally:
+            # Unmute microphone and revert UI status after commentary
+            self.session.is_speaking = False
+            self.session.status.set_speaking(False)
+            if not self.config.text_only_mode:
+                self.session.status.set_listening(True)
 
     async def generate_fabrication_message(self, message_type: str) -> str:
         """Generate welcome/goodbye message for fabrication start/end."""
         if message_type == "start":
-            prompt = "Generate a brief, friendly welcome message for starting a collaborative fabrication session with a human. Be encouraging and ready to help. Keep it under 20 words."
-            default = "Hello! I'm ready to help with your fabrication project. Let's build something amazing together!"
+            prompt = "Generate a concise, friendly welcome: 'Mave here—ready to assist with fabrication tasks. How can I help you today?' Keep under 20 words."
+            default = "Mave here—ready to assist with fabrication tasks. How can I help you today?"
         else:  # end
-            prompt = "Generate a brief, appreciative goodbye message for ending a collaborative fabrication session. Thank the human for working together. Keep it under 20 words."
-            default = "Great work! It was a pleasure collaborating with you on this fabrication project. Until next time!"
+            prompt = "Generate a concise, appreciative goodbye: 'Fabrication complete. Thank you for collaborating—until next time!' Keep under 20 words."
+            default = "Fabrication complete. Thank you for collaborating—until next time!"
         
         try:
             # Use the existing LLM to generate the message
@@ -1235,7 +1392,7 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
             return response.strip() if response else default
         except Exception as e:
             if self.config.debug_mode:
-                print(f"⚠️ [AGENT] Error generating fabrication message: {e}")
+                print(f"[{_timestamp()}] ⚠️ [AGENT] Error generating fabrication message: {e}")
             return default
 
     async def _prompt_llm_for_commentary(self, full_prompt: str) -> str:
@@ -1260,8 +1417,11 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
                         system_prompt = full_prompt
                         user_prompt = "Generate appropriate commentary."
             
-            # Use existing AsyncOpenAI client from the active session for commentary generation
-            client = self.session.client
+            # Use existing AsyncOpenAI client from session, or fallback to new AsyncOpenAI
+            client = getattr(self.session, 'client', None)
+            if client is None:
+                import openai as _openai
+                client = _openai.AsyncOpenAI(api_key=self.api_key)
             
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -1276,7 +1436,7 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
             
         except Exception as e:
             if self.config.debug_mode:
-                print(f"❌ [LLM ERROR] {e}")
+                print(f"[{_timestamp()}] ❌ [LLM ERROR] {e}")
             return f"Executing task..."  # Fallback
 
     def _generate_task_received_commentary(self, event_data: dict) -> str:
@@ -1354,3 +1514,32 @@ class OpenAIVoiceAgent(BaseVoiceAgent):
                 return f"Task {task_name} completed successfully."
         else:
             return f"Encountered an issue with {task_name}. Let me try again."
+
+    async def _prompt_llm_for_task_announcement(self, task_context: str) -> str:
+        """Generate commentary for task announcements."""
+        try:
+            from ur.config.system_prompts import get_system_prompt
+            
+            # Get the system prompt with fabrication context
+            system_prompt = get_system_prompt(mode="fabrication", robot_connected=True)
+            
+            # Use existing AsyncOpenAI client from session, or fallback to new AsyncOpenAI
+            client = getattr(self.session, 'client', None)
+            if client is None:
+                import openai as _openai
+                client = _openai.AsyncOpenAI(api_key=self.api_key)
+            
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": task_context}
+                ],
+                max_tokens=self.config.commentary_max_tokens,
+                temperature=self.config.commentary_temperature
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            if self.config.debug_mode:
+                print(f"[{_timestamp()}] ❌ [LLM ERROR] {e}")
+            return f"Starting {task_context}..."  # Fallback

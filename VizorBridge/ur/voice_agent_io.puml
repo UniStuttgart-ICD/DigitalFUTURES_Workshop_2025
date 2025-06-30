@@ -1,0 +1,58 @@
+@startuml
+title Voice Agent Hybrid I/O (OpenAI Realtime WebSocket)
+
+actor User
+
+participant "Microphone" as Mic
+participant "Text Input UI" as TextUI
+participant "RealtimeSession" as Session
+participant "OpenAIVoiceAgent" as VoiceAgent
+participant "URBridge" as Bridge
+participant "OpenAI Realtime API" as Realtime
+participant "Headphones" as Headphones
+participant "VoiceAgentStatus" as UI
+
+== Hybrid Speech Input Flow ==
+User -> Mic: speak command
+Mic -> Session: _audio_input_stream_impl()
+Session -> Session: encode_audio_for_openai(audio_bytes)
+Session -> Realtime: input_audio_buffer.append(audio_bytes)
+Realtime --> Session: conversation.item.created (transcript)
+Session -> VoiceAgent: _emit_event(TRANSCRIPTION_COMPLETED)
+VoiceAgent -> Bridge: _notify_agent_sync('transcript_received', data)
+Session -> UI: display recognized text
+
+== Hybrid Text Input Flow ==
+User -> TextUI: type text command
+TextUI -> Session: send_message(text)
+Session -> Realtime: conversation.item.create (text)
+Realtime --> Session: conversation.item.created (assistant_text)
+Session -> VoiceAgent: _emit_event(RESPONSE_STARTED)
+VoiceAgent -> Bridge: _notify_agent_sync('command_received', data)
+Session -> UI: display entered text
+
+== Task Execution & Commentary ==
+Bridge -> Bridge: handle_task(msg)
+Bridge -> Bridge: execute_task_with_commentary(...)
+Bridge -> Bridge: _notify_agent_sync('task_completed', data)
+Bridge -> VoiceAgent: handle_task_event('task_completed', data)
+VoiceAgent -> Session: send_message(commentary_text)
+Session -> Realtime: conversation.item.create (commentary_text)
+alt audio response enabled
+  Realtime --> Session: response.audio.delta (audio_chunk)
+  Session -> Session: _play_audio_response(audio_chunk)
+  Session -> Headphones: play_audio(audio_chunk)
+else text response
+  Realtime --> Session: conversation.item.created (commentary_text)
+  Session -> UI: display_text(commentary_text)
+end
+
+== Tool Execution Flow ==
+Realtime --> Session: response.function_call_delta
+Session -> Session: _handle_tool_call(event)
+Session -> Session: _execute_tool(tool, args)
+Session -> Bridge: execute via registered tools
+Bridge -> Bridge: perform robot action
+Session -> Realtime: conversation.item.create (tool_response)
+
+@enduml 

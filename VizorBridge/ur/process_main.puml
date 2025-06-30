@@ -1,0 +1,133 @@
+@startuml
+title Process Diagram: uv run main.py
+
+actor User as User
+participant "main.py" as Main
+participant "roslibpy.Ros" as RosClient
+participant "URVoiceSystem\n(Launcher)" as Launcher
+participant "URBridge" as Bridge
+participant "BaseVoiceAgent\n(OpenAI/Smol)" as Agent
+participant "SystemCleanupManager" as CleanupManager
+participant "URConnection" as RobotConn
+
+User -> Main: executes `uv run main.py`
+Main -> RosClient: __init__(ROS_HOST, ROS_PORT)
+Main -> RosClient: run()
+activate Main
+activate RosClient
+RosClient -> RosClient: Connect to rosbridge
+deactivate RosClient
+
+Main -> Launcher: __init__(client)
+activate Launcher
+Launcher -> Bridge: __init__(name, client, robot_ip)
+activate Bridge
+Bridge -> RobotConn: get_robot() (singleton)
+activate RobotConn
+RobotConn -> RobotConn: _connect() via RTDE
+deactivate RobotConn
+Bridge -> CleanupManager: set_bridge(self)
+Launcher -> Bridge: set_launcher_reference(self)
+Launcher -> CleanupManager: register_component(...)
+Bridge -> Bridge: Subscribe to /Robot/command topic
+Bridge -> Bridge: Subscribe to /Robot/task topic
+deactivate Bridge
+Launcher -> Main: return URVoiceSystem instance
+deactivate Launcher
+Main -> Main: Enters main loop, waiting...
+
+note over Main, Agent: System is now idle,\nwaiting for ROS command.\nAgent is NOT created yet.
+
+...Time Passes...
+
+participant "ROS Topic\n/Robot/command" as RosTopic
+
+RosTopic -> Bridge: Receives "START_FABRICATION"
+activate Bridge
+Bridge -> Bridge: process_command(msg)
+Bridge -> Bridge: _start_fabrication()
+Bridge -> Launcher: create_voice_agent(bridge)
+activate Launcher
+Launcher -> Launcher: _initialize_agent()
+note right: Factory method creates\nOpenAIVoiceAgent or SmolVoiceAgent\nbased on AGENT_TYPE config
+Launcher -> Agent: __init__(bridge_ref, ui_ref, config)
+activate Agent
+Agent -> Agent: Register with bridge
+Launcher -> Bridge: set_agent_reference(agent)
+Launcher -> CleanupManager: register_component() (update with agent)
+deactivate Launcher
+Bridge -> Bridge: _start_voice_agent_thread()
+
+note right of Bridge: Agent.start() is called\nin a new thread using asyncio.run()
+
+Agent -> Agent: start()
+Agent -> Agent: Connect to AI Service\n(OpenAI Realtime API / HuggingFace)
+Agent -> Agent: Start listening loop
+Agent -> Agent: Initialize audio/text streams
+
+deactivate Agent
+Bridge -> Bridge: publish_status("fabrication_started")
+deactivate Bridge
+
+note over Main, Agent: System is now active\nand listening for voice/text commands.\nAgent handles task events via handle_task_event()
+
+...Time Passes...
+
+RosTopic -> Bridge: Receives task execution request
+activate Bridge
+Bridge -> Bridge: handle_task(msg)
+Bridge -> Bridge: execute_task_with_commentary(...)
+Bridge -> Agent: _notify_agent_sync('task_starting', data)
+activate Agent
+Agent -> Agent: handle_task_event() generates commentary
+Agent -> Agent: Speak/display commentary
+deactivate Agent
+Bridge -> Bridge: Perform robot movements
+Bridge -> Agent: _notify_agent_sync('task_completed', data)
+deactivate Bridge
+
+...Time Passes...
+
+RosTopic -> Bridge: Receives "END_FABRICATION"
+activate Bridge
+Bridge -> Bridge: process_command(msg)
+Bridge -> Bridge: _end_fabrication()
+Bridge -> Bridge: _generate_and_display_fabrication_message("end")
+Bridge -> Bridge: _stop_voice_agent_completely()
+activate Agent
+Agent -> Agent: stop_sync() or stop()
+Agent -> Agent: Cleanup AI connections
+deactivate Agent
+Bridge -> Launcher: shutdown_requested = True
+Bridge -> Bridge: publish_status("fabrication_complete")
+deactivate Bridge
+
+note over Main, Agent: System detects shutdown_requested flag
+
+Main -> Main: Detects ur_system.shutdown_requested
+Main -> Main: Perform session cleanup
+Main -> Launcher: reset_for_restart()
+activate Launcher
+Launcher -> Launcher: Reset agent reference to None
+Launcher -> Launcher: Reset shutdown flag
+Launcher -> CleanupManager: register_component() (cleanup agent ref)
+deactivate Launcher
+
+note over Main, Agent: System returned to idle state\nwithout process restart.\nRobot and ROS connections maintained.
+
+== Full System Shutdown (Ctrl+C) ==
+
+User -> Main: KeyboardInterrupt (Ctrl+C)
+Main -> CleanupManager: cleanup_system_sync()
+activate CleanupManager
+CleanupManager -> CleanupManager: Execute cleanup in phases
+CleanupManager -> Agent: stop_sync() (if exists)
+CleanupManager -> Bridge: _cleanup_fabrication()
+CleanupManager -> Bridge: _cleanup_connections()
+CleanupManager -> RobotConn: cleanup_global_robot()
+CleanupManager -> CleanupManager: cleanup_all_components()
+deactivate CleanupManager
+Main -> RosClient: terminate() (if connected)
+Main -> Main: sys.exit(0) or os._exit(0)
+
+@enduml 

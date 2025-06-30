@@ -287,4 +287,26 @@ class VoiceAgentStatus:
                 pass
         
         # Wait longer for any remaining threads to finish
-        time.sleep(0.2) 
+        time.sleep(0.2)
+
+    def force_shutdown(self):
+        """Force complete shutdown of all UI components."""
+        self.is_stopped = True
+        
+        # Stop live display immediately
+        if self.live_display:
+            try:
+                self.live_display.stop()
+            except Exception:
+                pass
+            finally:
+                self.live_display = None
+        
+        # Clear all references
+        self.console = None
+        
+        # Clear all state
+        self.is_listening = False
+        self.is_speaking = False
+        self.is_processing = False
+        self.tool_executing = None 

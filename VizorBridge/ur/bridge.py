@@ -5,6 +5,9 @@ import os
 import math
 import asyncio
 import threading
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+from rich.progress import TimeElapsedColumn
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,6 +36,8 @@ from ur.config.topics import (
     TASK_EXECUTE_MSG_TYPE,
     STD_STRING_MSG_TYPE,
     POSITION_MSG_TYPE,
+    ROS_HOST,
+    ROS_PORT
 )
 from ur.config.system_config import (
     COMMAND_START,
@@ -41,6 +46,9 @@ from ur.config.system_config import (
     STATUS_FABRICATION_COMPLETE,
     STATUS_GRIPPER_OPEN,
     STATUS_GRIPPER_CLOSE,
+    STATUS_SUCCESS,
+    STATUS_FAILED,
+    STATUS_STOP,
 )
 from ur.tools.gripper_tools import _set_gripper_output
 
@@ -61,8 +69,12 @@ class URBridge(RobotInterface):
         client: roslibpy.Ros,
         robot_ip: str | None = None,
         task_topic: str = TASK_EXECUTE_TOPIC,
+        command_topic: str = COMMAND_TOPIC,
     ):
+        # Initialize base RobotInterface with name and ROS client
         super().__init__(name, client)
+        self.pause = False
+        self.stop = False
         self.robot_ip = robot_ip or ROBOT_IP
         
         # Use shared global robot connection to avoid RTDE conflicts
@@ -76,6 +88,7 @@ class URBridge(RobotInterface):
         self.fabrication_active = False
         self.voice_agent = None
         self.voice_agent_thread = None
+        self.agent_event_loop = None
         self.launcher_ref = None  # Reference back to launcher for agent creation
 
         # Subscribe to the specified task topic
@@ -86,8 +99,13 @@ class URBridge(RobotInterface):
         )
         self.task_listener.subscribe(self.handle_task)
 
-        # NOTE: Command topic subscription is handled by parent RobotInterface class
-        # We override process_command method to handle fabrication lifecycle
+        # Subscribe to the command topic (moved from RobotInterface)
+        self.command_listener = roslibpy.Topic(
+            self.client,
+            command_topic,
+            STD_STRING_MSG_TYPE,
+        )
+        self.command_listener.subscribe(self.process_command)
 
         # Add publishers for status and position as defined in PlantUML
         self.status_publisher = roslibpy.Topic(
@@ -105,6 +123,12 @@ class URBridge(RobotInterface):
         # Register this bridge instance for tool access (Phase 1 integration)
         set_bridge(self)
         print(f"✅ [BRIDGE] Registered for tool access: {self.name}")
+
+        # Rich console for improved movement and progress output
+        self.console = Console()
+        self._should_stop_movement = False
+        # Disable rich.Progress for movement tasks to avoid UI conflicts
+        self._in_task_progress = True
 
     def set_agent_reference(self, agent):
         """Allow agent to register for task notifications."""
@@ -135,13 +159,13 @@ class URBridge(RobotInterface):
     def publish_status(self, status_message: str):
         """Publish robot status updates to /Robot/status/physical"""
         try:
-            self.status_publisher.publish(roslibpy.Message({'data': status_message}))
+            self.status_publisher.publish({'data': status_message})
             print(f"📡 [ROS PUBLISH] Status: {status_message}")
         except Exception as e:
             print(f"❌ [ROS ERROR] Failed to publish status: {e}")
 
     def publish_joint_state(self):
-        """Publish current joint state to /UR10/set_position"""
+        """Publish current joint state to position topic"""
         if not self.is_connected or not self.robot_connection:
             return
         
@@ -160,7 +184,7 @@ class URBridge(RobotInterface):
                     'velocity': [],
                     'effort': []
                 }
-                self.position_publisher.publish(roslibpy.Message(joint_state_msg))
+                self.position_publisher.publish(joint_state_msg)
         except Exception as e:
             print(f"Failed to publish joint state: {e}")
 
@@ -215,6 +239,7 @@ class URBridge(RobotInterface):
             self.fabrication_active = False
             self.voice_agent = None
             self.voice_agent_thread = None
+            self.agent_event_loop = None
     
     def _cleanup_connections(self):
         """Clean up ROS connections and robot state."""
@@ -246,35 +271,50 @@ class URBridge(RobotInterface):
 
     def handle_task(self, msg: dict):
         """Callback for incoming ROS tasks with agent notification."""
-        # Offload task processing to background thread to avoid blocking ROS subscriber
-        threading.Thread(target=lambda: self._handle_task_thread(msg), daemon=True).start()
+        # Process the task in a separate thread to avoid blocking the ROS client
+        thread = threading.Thread(target=self._handle_task_thread, args=(msg,))
+        thread.start()
         print("🔄 [BRIDGE] Task received, processing in background thread")
 
     def _handle_task_thread(self, msg: dict):
-        """Background thread handler for ROS tasks."""
-        data = msg.get("msg", msg)
-        task_name = data.get('name', 'Unknown')
+        """Task processing logic that runs in a background thread."""
+        print(f"🔄 [BRIDGE] Task received, processing in background thread")
+        # ROSlibpy wraps message payload under 'msg', mimic test behavior
+        data = msg.get('msg', msg)
+        task_name = data.get('name', '').lower()
+        tcps = data.get('tcps')
+        trajectory = data.get('trajectory')  # Extract full trajectory object
+        
+        # Notify the agent about the task if present
+        if self.voice_agent and hasattr(self.voice_agent, 'handle_task_event'):
+            print(f"🗣️  [BRIDGE] Notifying voice agent of task: {task_name}")
+            event_data = {"task_name": task_name, "tcps": tcps, "trajectory": trajectory}
+            coro = self.voice_agent.handle_task_event("task_received", event_data)
+            if self.agent_event_loop and self.agent_event_loop.is_running():
+                asyncio.run_coroutine_threadsafe(coro, self.agent_event_loop)
+                print(f"✅ [BRIDGE] Agent notification scheduled for task: {task_name}")
+            else:
+                try:
+                    asyncio.run(coro)
+                except Exception as e:
+                    print(f"⚠️ [BRIDGE] Agent notification error: {e}")
+        # Always execute the task to ensure robot movement
+        success = self.execute_task(task_name=task_name, tcps=tcps, trajectory=trajectory)
 
-        print(f"\n🎯 [ROS TASK] {task_name}")
-        # Notify agent about incoming task with system prompt context
-        if self.agent_ref:
-            self._notify_agent_sync('task_received', {
-                'task_name': task_name,
-                'task_data': data,
-                'context_type': 'task_execute',
-                'source_topic': 'TASK_EXECUTE_TOPIC'
-            })
-        # Execute the task with commentary
-        success = self.execute_task_with_commentary(
-            task_name,
-            data.get("tcp", []),
-            data.get("trajectory")
-        )
-        print(f"   {'✅' if success else '❌'} {'Success' if success else 'Failed'}\n")
+        if success:
+            #NOTE: Real success message will be now handled by the agent
+            status_message = f"{STATUS_SUCCESS}_{task_name}"
+            self._notify_agent_sync('task_completed', {'task_name': task_name})
+        else:
+            status_message = STATUS_FAILED
+            self._notify_agent_sync('task_failed', {'task_name': task_name, 'reason': 'Execution failed'})
+         
+        self.publish_status(status_message)
+        print(f"✅ [TASK_EXECUTION] Finished processing task: {task_name}, Success: {success}")
 
     def process_command(self, msg: dict):
         """Override parent's command handling with fabrication lifecycle management."""
-        command = msg.get('data')
+        command = msg.get('data', '').lower()
         print(f"\n🎛️  [ROS COMMAND] {command}")
         
         # Notify agent about command with system prompt context (if agent exists)
@@ -290,41 +330,58 @@ class URBridge(RobotInterface):
             self.connect()
             self._start_fabrication()
         elif command == COMMAND_END:
-            if self.fabrication_active:
-                self._end_fabrication()
-            # End fabrication stops the bridge gracefully
-            self.cleanup(include_fabrication=True, include_connections=True)
-        else:
-            # Handle other commands using parent's logic for backwards compatibility
-            if command == "pause":
-                print("   ⏸️  Executing: Pause robot operations")
-                self.pause = True
-            elif command == "resume":
-                print("   ▶️  Executing: Resume robot operations")
-                self.pause = False
-            elif command == "stop":
-                print("   🛑 Executing: Stop robot operations")
-                self.stop = True  # This is the parent's flag, not our method
-            elif command == "home":
-                print("   🏠 Executing: Move to home position")
-                self.go_to_home()
+            # Signal the launcher to initiate a full system shutdown.
+            # Publish STOP status
+            print("🔄 [BRIDGE] END_FABRICATION received, ending fabrication")
+            self.publish_status(STATUS_STOP)
+            if self.launcher_ref:
+                self.launcher_ref.shutdown_requested = True
             else:
-                print(f"   ❓ Unknown: {command}")
-        print()
+                # Fallback if no launcher is present (e.g., standalone bridge test)
+                print("⚠️ [BRIDGE] No launcher reference, performing self-cleanup.")
+                self.cleanup()
+        elif command == "pause":
+            print("   ⏸️  Executing: Pause robot operations")
+            self.pause = True
+        elif command == "resume":
+            self.pause = False
+            self.publish_status("Robot resumed")
+            print("▶️ [BRIDGE] Robot resumed")
+        elif command == "stop":
+            self.stop = True
+            self._should_stop_movement = True
+            # Publish STOP status
+            self.publish_status(STATUS_STOP)
+            print("⏹️ [BRIDGE] Stop command received, initiating graceful stop...")
+            # Immediately stop robot movement if active
+            self.stop_robot()
+            # Direct cleanup if no task is running
+            if not self.fabrication_active:
+                self.cleanup()
+        elif command == "home":
+            print("   🏠 Executing: Move to home position")
+            self.go_to_home()
+        else:
+            print(f"   ❓ Unknown command: {command}")
 
     def _start_fabrication(self):
         """Start fabrication mode - create and start voice agent."""
         print("🚀 [FABRICATION] Starting fabrication mode...")
         
-        # Recreate and re-subscribe to task topic in case it was unsubscribed
+        # Recreate and re-subscribe to task topic (unsubscribe previous listener first)
         try:
+            if hasattr(self, 'task_listener'):
+                try:
+                    self.task_listener.unsubscribe()
+                except Exception:
+                    pass
             self.task_listener = roslibpy.Topic(
                 self.client,
                 TASK_EXECUTE_TOPIC,
                 TASK_EXECUTE_MSG_TYPE,
             )
             self.task_listener.subscribe(self.handle_task)
-            print("🔄 [BRIDGE] Re-subscribed to task listener")
+            print("🔄 [BRIDGE] Task listener unsubscribed and re-subscribed")
         except Exception as e:
             print(f"⚠️ [BRIDGE] Failed to re-subscribe to task listener: {e}")
         
@@ -349,7 +406,7 @@ class URBridge(RobotInterface):
         if self.launcher_ref and not self.voice_agent:
             try:
                 # Create voice agent via launcher
-                self.voice_agent = self.launcher_ref.create_agent()
+                self.voice_agent = self.launcher_ref.create_voice_agent(self)
                 if self.voice_agent:
                     # Start agent in background thread
                     self._start_voice_agent_thread()
@@ -357,16 +414,13 @@ class URBridge(RobotInterface):
                     # Update voice agent UI to active state
                     if hasattr(self.voice_agent, 'ui'):
                         self.voice_agent.ui.set_fabrication_active(True)
-                    
-                    # Generate and display welcome message
-                    self._generate_and_display_fabrication_message("start")
                 else:
                     print("⚠️ [FABRICATION] Failed to create voice agent")
             except Exception as e:
                 print(f"❌ [FABRICATION] Error starting voice agent: {e}")
         else:
             if not self.launcher_ref:
-                print("⚠️ [FABRICATION] No launcher reference available")
+                print("❌ [BRIDGE] No launcher reference, cannot create voice agent.")
             if self.voice_agent:
                 print("⚠️ [FABRICATION] Voice agent already running")
 
@@ -376,9 +430,6 @@ class URBridge(RobotInterface):
         
         if self.voice_agent:
             try:
-                # Generate and display goodbye message first
-                self._generate_and_display_fabrication_message("end")
-                
                 # Stop the voice agent properly
                 self._stop_voice_agent_completely()
             except Exception as e:
@@ -403,23 +454,29 @@ class URBridge(RobotInterface):
             self.launcher_ref.shutdown_requested = True
 
     def _start_voice_agent_thread(self):
-        """Start the voice agent in a background thread."""
+        """Start the voice agent in a background thread with its own asyncio loop."""
         if not self.voice_agent:
             return
-            
-        async def run_agent_async():
+
+        def _run_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.agent_event_loop = loop
             try:
-                await self.voice_agent.start()
+                loop.run_until_complete(self.voice_agent.start())
             except Exception as e:
                 print(f"❌ [AGENT] Voice agent error: {e}")
+            finally:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
 
         self.voice_agent_thread = threading.Thread(
-            target=lambda: asyncio.run(run_agent_async()),
+            target=_run_loop,
             daemon=True,
             name="VoiceAgentThread"
         )
         self.voice_agent_thread.start()
-        print("✅ [FABRICATION] Voice agent started successfully")
+        print("✅ [FABRICATION] Voice agent thread started")
 
     def _stop_voice_agent_completely(self):
         """Stop the voice agent session and clean up thread."""
@@ -500,7 +557,7 @@ class URBridge(RobotInterface):
                 
                 # Make the voice agent actually speak the message
                 self._speak_fabrication_message(message)
-                    
+                
             else:
                 # Fallback messages
                 fallback_message = ""
@@ -533,62 +590,32 @@ class URBridge(RobotInterface):
             self._speak_fabrication_message(fallback_message)
 
     def _speak_fabrication_message(self, message: str):
-        """Make the voice agent speak the fabrication message."""
+        """Make the voice agent speak the fabrication message, waiting for connection if necessary."""
         if not self.voice_agent or not message:
             return
-            
+
+        async def _wait_and_speak():
+            """Wait for the agent session to be ready, then send the message."""
+            # Wait up to 5 seconds for the session to become connected
+            for _ in range(10): # 10 * 0.5s = 5s timeout
+                if (hasattr(self.voice_agent, 'session') and self.voice_agent.session and
+                    hasattr(self.voice_agent.session, 'is_connected') and self.voice_agent.session.is_connected):
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                print(f"⚠️ [SPEAK] Agent session not ready in time. Cannot speak message: {message[:50]}...")
+                return
+
+            try:
+                # Always use agent send_message to speak via OpenAI voice
+                await self.voice_agent.session.send_message(message)
+                print("🔊 Assistant speaking via agent")
+            except Exception as e:
+                print(f"⚠️ [SPEAK] Error sending message to agent: {e}")
+
         try:
-            # For OpenAI agents that have a session with direct connection
-            if hasattr(self.voice_agent, 'session') and self.voice_agent.session:
-                # Check if session is connected and ready
-                if (hasattr(self.voice_agent.session, 'connection') and 
-                    self.voice_agent.session.connection and
-                    hasattr(self.voice_agent.session, 'is_connected') and
-                    self.voice_agent.session.is_connected):
-                    
-                    # Create a conversation item as if the assistant is saying this message
-                    async def speak_message():
-                        await self.voice_agent.session.connection.send({
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{"type": "text", "text": message}]
-                            }
-                        })
-                        # Trigger a response to make the assistant speak
-                        await self.voice_agent.session.connection.send({"type": "response.create"})
-                    
-                    # Run the async function
-                    asyncio.run(speak_message())
-                    print("🔊 Assistant speaking...")
-                    return
-                    
-                elif hasattr(self.voice_agent.session, 'send_message'):
-                    # Fallback to send_message approach if connection not ready
-                    try:
-                        asyncio.run(self.voice_agent.session.send_message(message))
-                        print("🔊 Assistant speaking...")
-                        return
-                    except Exception as e:
-                        print(f"⚠️ [SPEAK] Send message failed: {e}")
-                
-                else:
-                    print(f"⚠️ [SPEAK] Session not connected yet - message: {message[:50]}...")
-            
-            # For SmolAgent with TTS capability  
-            if hasattr(self.voice_agent, 'session') and hasattr(self.voice_agent.session, 'config'):
-                if getattr(self.voice_agent.session.config, 'enable_tts', False):
-                    # Use SmolAgent TTS
-                    if hasattr(self.voice_agent.session, 'voice_processor'):
-                        try:
-                            audio_data = self.voice_agent.session.voice_processor.text_to_speech(message)
-                            if audio_data:
-                                self.voice_agent.session.voice_processor.play_audio(audio_data)
-                                print("🔊 Assistant speaking...")
-                        except Exception as e:
-                            print(f"⚠️ [TTS] Error with SmolAgent TTS: {e}")
-            
+            # Run the async wrapper function
+            asyncio.run(_wait_and_speak())
         except Exception as e:
             print(f"⚠️ [SPEAK] Error making agent speak: {e}")
 
@@ -611,50 +638,93 @@ class URBridge(RobotInterface):
         if not self.is_connected or not self.robot_connection:
             return False
         try:
-            # Convert configured home position (in degrees) to radians
             home_joints_rad = [math.radians(angle) for angle in HOME_POSITION]
-            success = self.robot_connection.move_j(home_joints_rad, ROBOT_HOME_SPEED, ROBOT_HOME_ACCELERATION)
-            if success:
-                self.publish_joint_state()
-            return success
+
+            # Spawn a background thread to avoid blocking command handler
+            def _home_move():
+                try:
+                    if hasattr(self.robot_connection, "rtde_c") and self.robot_connection.rtde_c:
+                        self.robot_connection.rtde_c.moveJ(
+                            home_joints_rad,
+                            ROBOT_HOME_SPEED,
+                            ROBOT_HOME_ACCELERATION,
+                            asynchronous=True,
+                        )
+                        self.robot_connection.wait_for_movement_completion(
+                            timeout=90, show_progress=False
+                        )
+                    else:
+                        self.robot_connection.move_j(
+                            home_joints_rad,
+                            ROBOT_HOME_SPEED,
+                            ROBOT_HOME_ACCELERATION,
+                        )
+
+                    self.publish_joint_state()
+                    try:
+                        from ur.config.system_config import generate_movement_status
+
+                        self.publish_status(
+                            generate_movement_status("HOME", status_type="complete")
+                        )
+                    except Exception:
+                        self.publish_status("at_home_position")
+
+                    self.console.print("[green]✅ Robot at home position[/green]")
+                except Exception as e:
+                    self.console.print(f"[red]❌ Home move failed: {e}[/red]")
+                    self.publish_status(STATUS_FAILED)
+
+            threading.Thread(target=_home_move, daemon=True).start()
+            # Immediately acknowledge – movement in background
+            return True
         except Exception:
             return False
 
     def moveL(self, tcp_pose: list, speed: float = ROBOT_MOVE_SPEED, acceleration: float = ROBOT_ACCELERATION) -> bool:
-        """Moves the robot linearly to a given TCP pose."""
+        """Moves the robot linearly to a given TCP pose with Rich progress support."""
         if not self.is_connected or not self.robot_connection:
             return False
         try:
-            success = self.robot_connection.move_l(tcp_pose, speed, acceleration)
+            # Send movement command
+            self.console.print(f"[yellow]moveL: Sending TCP pose: {tcp_pose}")
+            if hasattr(self.robot_connection, 'rtde_c') and self.robot_connection.rtde_c:
+                self.robot_connection.rtde_c.moveL(tcp_pose, speed, acceleration, asynchronous=True)
+                if self._in_task_progress:
+                    success = self._wait_for_movement_no_progress()
+                else:
+                    success = self._wait_for_movement_with_progress("Linear Movement")
+            else:
+                success = self.robot_connection.move_l(tcp_pose, speed, acceleration)
+            self.console.print(f"[cyan]moveL result: {success}")
             if success:
                 self.publish_joint_state()
             return success
-        except Exception:
+        except Exception as e:
+            self.console.print(f"❌ [red]Linear movement failed:[/red] {e}")
             return False
 
     def moveJ(self, joint_positions: list, speed: float = ROBOT_MOVE_SPEED, acceleration: float = ROBOT_ACCELERATION) -> bool:
-        """Moves the robot in joint space to the given positions."""
+        """Moves the robot in joint space to the given positions with Rich progress support."""
         if not self.is_connected or not self.robot_connection:
             return False
         try:
-            success = self.robot_connection.move_j(joint_positions, speed, acceleration)
+            # Send joint movement command
+            self.console.print(f"[yellow]moveJ: Sending joint positions: {joint_positions}")
+            if hasattr(self.robot_connection, 'rtde_c') and self.robot_connection.rtde_c:
+                self.robot_connection.rtde_c.moveJ(joint_positions, speed, acceleration, asynchronous=True)
+                if self._in_task_progress:
+                    success = self._wait_for_movement_no_progress()
+                else:
+                    success = self._wait_for_movement_with_progress("Joint Movement")
+            else:
+                success = self.robot_connection.move_j(joint_positions, speed, acceleration)
+            self.console.print(f"[cyan]moveJ result: {success}")
             if success:
                 self.publish_joint_state()
             return success
-        except Exception:
-            return False
-
-    def execute_tcp_frames(self, frames: list) -> bool:
-        """Executes a sequence of linear movements to given TCP frames."""
-        if not self.is_connected or not self.robot_connection:
-            return False
-        try:
-            for frame in frames:
-                if not self.moveL(frame):
-                    # Stop if any single move fails
-                    return False
-            return True
-        except Exception:
+        except Exception as e:
+            self.console.print(f"❌ [red]Joint movement failed:[/red] {e}")
             return False
 
     def execute_trajectory_msg(self, trajectory: dict) -> bool:
@@ -671,6 +741,11 @@ class URBridge(RobotInterface):
 
         try:
             for point in points:
+                # Check for stop command before each trajectory point (but allow task to start fresh)
+                if getattr(self, '_should_stop_movement', False):
+                    print("🛑 [TRAJECTORY] Stop command received, aborting trajectory execution")
+                    return False
+                    
                 positions = point.get("positions", [])
                 if len(positions) == 6:
                     positions_rad = [math.radians(p) for p in positions]
@@ -679,6 +754,7 @@ class URBridge(RobotInterface):
                         return False
                 else:
                     # Invalid point, stop execution
+                    print(f"❌ [TRAJECTORY] Invalid point: {point}")
                     return False
             return True
         except Exception:
@@ -710,31 +786,60 @@ class URBridge(RobotInterface):
 
     def execute_task(self, task_name: str, tcps: list = None, trajectory: dict = None) -> bool:
         """Execute a task based on its name pattern with appropriate gripper control."""
+        # Reset movement stop flag for new task execution (keep self.stop for command processing)
+        self._should_stop_movement = False
+        
         # Import status generation function here to avoid circular imports
         from ur.config.system_config import generate_task_status
+        
+        # --- Timing start ---
+        task_start_time = time.time()
         
         task_name_lower = task_name.lower()
         success = False
         
+        # Handle pickup/place/home as before
         if "pickup" in task_name_lower or "pick" in task_name_lower:
             success = self._handle_pickup_task(tcps, trajectory)
         elif "place" in task_name_lower:
             success = self._handle_place_task(tcps, trajectory)
         elif "home" in task_name_lower:
             success = self._handle_home_task(tcps, trajectory)
+        # Handle pure gripper commands (no trajectory)
+        elif "gripper" in task_name_lower:
+            if "open" in task_name_lower:
+                success = self.control_gripper("open")
+            elif "close" in task_name_lower:
+                success = self.control_gripper("close")
+            else:
+                success = False
+        # Fallback: execute trajectory if provided
         else:
             success = self._execute_trajectory_only(tcps, trajectory)
         
         # CRITICAL: Only send SUCCESS status when entire task completes successfully
         if success and task_name:
-            success_status = generate_task_status(task_name, status_type="SUCCESS")
-            self.publish_status(success_status)
-            print(f"✅ [TASK SUCCESS] {success_status}")
+            #TODO: Uncommented to use voice to send 
+            # self.publish_status(STATUS_SUCCESS)
+            print(f"✅ [TASK SUCCESS] {STATUS_SUCCESS}")
+        
+        # --- Timing end & report ---
+        elapsed = time.time() - task_start_time
+        try:
+            self.console.print(f"⏱️  Task '{task_name}' finished in {elapsed:.2f} seconds")
+        except Exception:
+            print(f"⏱️  Task '{task_name}' finished in {elapsed:.2f} seconds")
         
         return success
 
     def execute_task_with_commentary(self, task_name: str, tcps: list = None, trajectory: dict = None) -> bool:
         """Execute task with LLM-generated commentary."""
+        
+        # Reset movement stop flag for new task execution (keep self.stop for command processing)
+        self._should_stop_movement = False
+        
+        # --- Timing start ---
+        task_start_time = time.time()
         
         # Notify agent task is starting
         if self.agent_ref:
@@ -755,7 +860,7 @@ class URBridge(RobotInterface):
         elif "home" in task_name_lower:
             success = self._handle_home_task_with_commentary(tcps, trajectory, task_name)
         else:
-            success = self._execute_trajectory_only(tcps, trajectory)
+            success = self.execute_task(task_name, tcps, trajectory)
         
         # Notify agent task completed
         if self.agent_ref:
@@ -771,42 +876,46 @@ class URBridge(RobotInterface):
             self.publish_status(success_status)
             print(f"✅ [TASK SUCCESS] {success_status}")
         
+        if not success:
+            self.publish_status(STATUS_FAILED)
+            print(f"❌ [TASK FAILED] {STATUS_FAILED}")
+        
+        # --- Timing end & report ---
+        elapsed = time.time() - task_start_time
+        try:
+            self.console.print(f"⏱️  Task '{task_name}' finished in {elapsed:.2f} seconds")
+        except Exception:
+            print(f"⏱️  Task '{task_name}' finished in {elapsed:.2f} seconds")
+        
         return success
 
     def _handle_pickup_task(self, tcps: list = None, trajectory: dict = None) -> bool:
         """Handle pickup tasks: Open gripper → Execute trajectory → Close gripper."""
         return (self.control_gripper("open") and 
-                self._execute_trajectory_only(tcps, trajectory) and 
-                self.control_gripper("close"))
+                self._execute_trajectory_only(tcps, trajectory) 
+                #and self.control_gripper("close")
+                )
 
     def _handle_place_task(self, tcps: list = None, trajectory: dict = None) -> bool:
         """Handle place tasks: Execute trajectory → Open gripper."""
-        return (self._execute_trajectory_only(tcps, trajectory) and 
-                self.control_gripper("open"))
+        return (self._execute_trajectory_only(tcps, trajectory)
+                #and self.control_gripper("open")
+                )
 
     def _handle_home_task(self, tcps: list = None, trajectory: dict = None) -> bool:
         """Handle home tasks: Execute trajectory only (no gripper control)."""
         return self._execute_trajectory_only(tcps, trajectory)
 
     def _execute_trajectory_only(self, tcps: list = None, trajectory: dict = None) -> bool:
-        """Execute either TCP frames or joint trajectory without gripper control."""
-        if tcps:
-            return self.execute_tcp_frames(tcps if isinstance(tcps, list) else [tcps])
-        elif trajectory:
+        """Execute joint trajectory without gripper control. TCP frames not supported."""
+        if trajectory:
             return self.execute_trajectory_msg(trajectory)
         else:
             return False
 
     def _handle_pickup_task_with_commentary(self, tcps: list = None, trajectory: dict = None, task_name: str = "") -> bool:
         """Handle pickup with dynamic LLM commentary."""
-        
-        # Request human assistance
-        if self.agent_ref:
-            self._notify_agent_sync('request_human_action', {
-                'action': 'place_element_on_supply_station',
-                'task_name': task_name
-            })
-        
+        # (Automated task) No human permission request for ROS tasks
         # Open gripper with announcement
         gripper_open = self.control_gripper("open")
         if gripper_open and self.agent_ref:
@@ -828,19 +937,18 @@ class URBridge(RobotInterface):
         trajectory_success = self._execute_trajectory_only(tcps, trajectory)
         
         # Close gripper with announcement
-        gripper_close = self.control_gripper("close")
-        if gripper_close and self.agent_ref:
+        #gripper_close = self.control_gripper("close")
+        if self.agent_ref:
             self._notify_agent_sync('robot_action', {
                 'action_type': 'element_secured',
                 'task_name': task_name,
                 'context_type': 'task_execute'
             })
         
-        return gripper_open and trajectory_success and gripper_close
+        return gripper_open and trajectory_success #and gripper_close
 
     def _handle_place_task_with_commentary(self, tcps: list = None, trajectory: dict = None, task_name: str = "") -> bool:
         """Handle place with dynamic LLM commentary."""
-        
         # Announce moving to assembly
         if self.agent_ref:
             self._notify_agent_sync('robot_action', {
@@ -851,16 +959,11 @@ class URBridge(RobotInterface):
         
         trajectory_success = self._execute_trajectory_only(tcps, trajectory)
         
-        # Request human to secure screws
-        if trajectory_success and self.agent_ref:
-            self._notify_agent_sync('request_human_action', {
-                'action': 'secure_screws',
-                'task_name': task_name
-            })
+        # (Automated task) Skipping human permission request
         
-        gripper_open = self.control_gripper("open")
+        # gripper_open = self.control_gripper("open")
         
-        return trajectory_success and gripper_open
+        return trajectory_success # and gripper_open
 
     def _handle_home_task_with_commentary(self, tcps: list = None, trajectory: dict = None, task_name: str = "") -> bool:
         """Handle home with commentary."""
@@ -873,3 +976,150 @@ class URBridge(RobotInterface):
             })
         
         return self._execute_trajectory_only(tcps, trajectory)
+
+    def stop_robot(self):
+        """Stop robot movement and break any ongoing progress."""
+        self._should_stop_movement = True
+        try:
+            if hasattr(self.robot_connection, 'rtde_c') and self.robot_connection.rtde_c:
+                try:
+                    self.robot_connection.rtde_c.stopL()
+                except Exception:
+                    pass
+                try:
+                    self.robot_connection.rtde_c.stopJ()
+                except Exception:
+                    pass
+                self.console.print("🛑 [bold red]Robot movements stopped![/bold red]")
+            else:
+                self.console.print("⚠️ [yellow]No active movement to stop or stop not supported.[/yellow]")
+        except Exception as e:
+            self.console.print(f"❌ [red]Error stopping robot:[/red] {e}")
+
+    def _wait_for_movement_no_progress(self, timeout: float = 60.0) -> bool:
+        """Wait for robot movement completion without progress bar."""
+        if not hasattr(self.robot_connection, 'rtde_c') or not self.robot_connection.rtde_c:
+            return False
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._should_stop_movement:
+                return False
+            try:
+                prog = self.robot_connection.rtde_c.getAsyncOperationProgress()
+                if prog is not None and prog >= 100:
+                    return True
+            except Exception:
+                pass
+            try:
+                if self.robot_connection.rtde_c.isSteady():
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        try:
+            return self.robot_connection.rtde_c.isSteady()
+        except Exception:
+            return False
+
+    def _wait_for_movement_with_progress(self, movement_type: str, timeout: float = 30.0) -> bool:
+        """Wait for robot movement completion with Rich progress bar and fallback estimation."""
+        if not self.robot_connection or not hasattr(self.robot_connection, 'rtde_c'):
+            return False
+        self._should_stop_movement = False
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            console=self.console,
+            refresh_per_second=10
+        ) as progress:
+            task = progress.add_task(f"🤖 {movement_type}", total=100)
+            start_time = time.time()
+            last_progress = -1
+            consecutive_steady_checks = 0
+            steady_required = 3
+            real_progress_seen = False
+            try:
+                # Small delay to ensure the movement command has been accepted
+                time.sleep(0.1)
+                while time.time() - start_time < timeout:
+                    if self._should_stop_movement:
+                        progress.update(task, completed=0)
+                        self.console.print(f"🛑 [red]{movement_type} stopped by user![/red]")
+                        return False
+                    elapsed = time.time() - start_time
+                    # --- Method 1: Primary progress from getAsyncOperationProgress() ---
+                    try:
+                        robot_progress = self.robot_connection.rtde_c.getAsyncOperationProgress()
+                        if robot_progress is not None:
+                            real_progress_seen = True
+                            progress.update(task, completed=robot_progress)
+                            if robot_progress >= 100.0:
+                                progress.update(task, completed=100)
+                                self.console.print(f"✅ [green]{movement_type} completed successfully![/green]")
+                                return True
+                            time.sleep(0.1)
+                            continue
+                    except Exception:
+                        # If we're in the very first second, we can silently ignore errors
+                        if elapsed < 1.0:
+                            progress.update(task, description=f"🤖 {movement_type} (fallback mode)")
+                    # --- Method 2: Fallback estimation combined with isSteady & velocity ---
+                    try:
+                        is_steady = self.robot_connection.rtde_c.isSteady()
+                        velocities = None
+                        if hasattr(self.robot_connection, 'rtde_r') and self.robot_connection.rtde_r:
+                            velocities = self.robot_connection.rtde_r.getActualQd()
+                        # Estimate progress linearly as a last resort (capped below 100)
+                        estimated_progress = min(99, (elapsed / (timeout * 0.95)) * 99)
+                        progress.update(task, completed=estimated_progress)
+                        # Consider the robot done if it's steady for several consecutive checks AND near-zero velocity
+                        velocity_near_zero = True
+                        if velocities and len(velocities) == 6:
+                            velocity_threshold = 0.01
+                            velocity_near_zero = all(abs(v) < velocity_threshold for v in velocities)
+                        if is_steady and velocity_near_zero:
+                            consecutive_steady_checks += 1
+                            if consecutive_steady_checks >= steady_required:
+                                progress.update(task, completed=100)
+                                self.console.print(f"✅ [green]{movement_type} completed (steady + zero velocity)![/green]")
+                                return True
+                        else:
+                            consecutive_steady_checks = 0
+                    except Exception:
+                        progress.update(task, description=f"🤖 {movement_type} (monitoring issues)")
+                    # --- Method 3: Program running state ---
+                    try:
+                        program_running = self.robot_connection.rtde_c.isProgramRunning()
+                        if program_running is False and self.robot_connection.rtde_c.isSteady():
+                            progress.update(task, completed=100)
+                            self.console.print(f"✅ [green]{movement_type} completed (no program running)![/green]")
+                            return True
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+                # --- Timeout reached ---
+                progress.update(task, description=f"⚠️ {movement_type} (timeout)")
+                self.console.print(f"⚠️ [yellow]{movement_type} timeout after {timeout}s[/yellow]")
+                if not real_progress_seen:
+                    self.console.print(f"⚠️ [yellow]No progress updates received from robot. Check connection or robot state.[/yellow]")
+                # Final verification: steady & velocities after timeout
+                try:
+                    is_steady = self.robot_connection.rtde_c.isSteady()
+                    velocities = None
+                    if hasattr(self.robot_connection, 'rtde_r') and self.robot_connection.rtde_r:
+                        velocities = self.robot_connection.rtde_r.getActualQd()
+                    if is_steady and velocities and all(abs(v) < 0.01 for v in velocities):
+                        progress.update(task, completed=100)
+                        self.console.print(f"✅ [green]{movement_type} actually completed (post-timeout verification)![/green]")
+                        return True
+                except Exception:
+                    pass
+                return False
+            except Exception as e:
+                progress.update(task, description=f"❌ {movement_type} (error)")
+                self.console.print(f"❌ [red]Error during {movement_type}: {e}[/red]")
+                return False

@@ -1,0 +1,227 @@
+@startuml
+' VizorBridge UR Module - High-Level UML Diagram
+
+package ur {
+
+  class URBridge {
+    +set_agent_reference(agent)
+    +set_launcher_reference(launcher)
+    +publish_status(status_message)
+    +publish_joint_state()
+    +connect()
+    +cleanup(include_fabrication, include_connections)
+    +handle_task(msg)
+    +process_command(msg)
+    +_start_fabrication()
+    +_end_fabrication()
+    +_start_voice_agent_thread()
+    +_stop_voice_agent_completely()
+    +_generate_and_display_fabrication_message(message_type)
+    +_speak_fabrication_message(message)
+    +execute_task_with_commentary(task_name, tcps, trajectory)
+    +_notify_agent_sync(event_type, event_data)
+    -robot_connection: URConnection
+    -agent_ref: BaseVoiceAgent
+    -fabrication_active: bool
+    -voice_agent: BaseVoiceAgent
+    -voice_agent_thread: Thread
+    -launcher_ref: URVoiceSystem
+    -agent_event_loop: EventLoop
+  }
+
+  class URConnection {
+    +_connect()
+    +get_joints()
+    +get_tcp_pose()
+    +move_l(pose, speed, acceleration)
+    +move_j(joint_positions, speed, acceleration)
+    +wait_for_movement_completion(timeout, show_progress)
+    +cleanup()
+    +ensure_connected()
+    -rtde_c: RTDEControlInterface
+    -rtde_r: RTDEReceiveInterface
+    -rtde_io: RTDEIOInterface
+    -is_connected: bool
+    -robot_ip: str
+  }
+
+  class URVoiceSystem {
+    +create_voice_agent(bridge)
+    +reset_for_restart()
+    +cleanup()
+    +print_configuration_summary()
+    -client: roslibpy.Ros
+    -bridge: URBridge
+    -agent: BaseVoiceAgent
+    -agent_thread: Thread
+    -ui: VoiceAgentStatus
+    -voice_config: VoiceAgentConfig
+    -shutdown_requested: bool
+  }
+
+  class BaseVoiceAgent {
+    <<abstract>>
+    +start()
+    +stop()
+    +stop_sync()
+    +handle_task_event(event_type, event_data)
+    #bridge: URBridge
+    #ui: VoiceAgentStatus
+    #should_stop: bool
+  }
+
+  class OpenAIVoiceAgent {
+    +start()
+    +stop()
+    +stop_sync()
+    +handle_task_event(event_type, event_data)
+    +speak_commentary(text)
+    +generate_fabrication_message(message_type)
+    -session: RealtimeSession
+    -config: VoiceAgentConfig
+    -api_key: str
+    -realtime_agent: RealtimeAgent
+  }
+
+  class SmolVoiceAgent {
+    +start()
+    +stop()
+    +stop_sync()
+    +handle_task_event(event_type, event_data)
+    -session: SmolAgentVoiceSession
+    -config: VoiceAgentConfig
+    -model_id: str
+    -provider: str
+  }
+
+  class RealtimeSession {
+    +connect()
+    +start_session_with_connection()
+    +send_message(text)
+    +close()
+    +interrupt_audio()
+    +_audio_input_stream_impl()
+    +_text_input_stream_impl()
+    +_handle_tool_call(event)
+    +_execute_tool(tool, args)
+    -agent: RealtimeAgent
+    -api_key: str
+    -websocket: WebSocket
+    -status: VoiceAgentStatus
+    -bridge: URBridge
+  }
+
+  class RealtimeAgent {
+    +add_tool(tool)
+    +get_session_config()
+    -name: str
+    -instructions: str
+    -tools: List[ToolDefinition]
+    -voice: str
+    -temperature: float
+    -model: str
+  }
+
+  class SmolAgentVoiceSession {
+    +start()
+    +stop()
+    +handle_task_event(event_type, event_data)
+    -agent: CodeAgent
+    -config: VoiceAgentConfig
+    -status: VoiceAgentStatus
+  }
+
+  class VoiceAgentStatus {
+    +start_live_display()
+    +stop_live_display()
+    +update_status(status)
+    +set_listening(listening)
+    +set_speaking(speaking)
+    +set_processing(processing)
+    +set_tool_executing(tool_name)
+    +set_fabrication_active(active)
+    +print_message(message, style)
+    +print_success(message)
+    +print_error(message)
+  }
+
+  class ToolRegistry {
+    +discover_tools(package_name)
+    +get_tools_for_agent(agent_type)
+    +get_function_map()
+    +refresh()
+    -tools: Dict[str, Callable]
+    -openai_specs: List[Dict]
+    -smolagents_tools: List[Any]
+  }
+
+  class VoiceAgentConfig {
+    +from_environment()
+    +validate()
+    +threaded_tools: bool
+    +model_provider: str
+    +model_id: str
+    +openai_voice: str
+    +openai_temperature: float
+    +debug_mode: bool
+    +enable_hybrid_mode: bool
+    +openai_use_server_vad: bool
+  }
+
+  class SystemCleanupManager {
+    +register_cleanup_task(task)
+    +register_component(component_name, **components)
+    +cleanup_all(timeout)
+    +_execute_phase_tasks(tasks)
+    -cleanup_tasks: Dict[CleanupPhase, List[CleanupTask]]
+    -cleanup_lock: Lock
+    -is_cleaning_up: bool
+  }
+
+  class CleanupTask {
+    +name: str
+    +phase: CleanupPhase
+    +cleanup_func: Callable
+    +timeout: float
+    +async_task: bool
+    +critical: bool
+  }
+
+  enum CleanupPhase {
+    VOICE_AGENT
+    BRIDGE_FABRICATION
+    BRIDGE_CONNECTIONS
+    ROBOT_CONNECTION
+    GLOBAL_CLEANUP
+    UI_CLEANUP
+  }
+
+  ' Relationships
+  URBridge --> URConnection : uses
+  URBridge --> BaseVoiceAgent : notifies
+  URBridge --> VoiceAgentStatus : status UI
+  URVoiceSystem --> URBridge : manages
+  URVoiceSystem --> BaseVoiceAgent : creates
+  URVoiceSystem --> VoiceAgentStatus : uses
+  BaseVoiceAgent <|-- OpenAIVoiceAgent
+  BaseVoiceAgent <|-- SmolVoiceAgent
+  OpenAIVoiceAgent --> RealtimeSession : uses
+  OpenAIVoiceAgent --> RealtimeAgent : uses
+  SmolVoiceAgent --> SmolAgentVoiceSession : uses
+  RealtimeSession --> RealtimeAgent : uses
+  RealtimeSession --> VoiceAgentStatus : uses
+  OpenAIVoiceAgent --> VoiceAgentConfig : config
+  SmolVoiceAgent --> VoiceAgentConfig : config
+  RealtimeSession --> URBridge : controls
+  SmolAgentVoiceSession --> URBridge : controls
+  ToolRegistry --> "*" : manages tools
+  SystemCleanupManager --> CleanupTask : manages
+  SystemCleanupManager --> CleanupPhase : uses
+  SystemCleanupManager --> URBridge : cleans up
+  SystemCleanupManager --> BaseVoiceAgent : cleans up
+  SystemCleanupManager --> VoiceAgentStatus : cleans up
+  SystemCleanupManager --> URConnection : cleans up
+  URVoiceSystem --> SystemCleanupManager : registers with
+}
+
+@enduml 

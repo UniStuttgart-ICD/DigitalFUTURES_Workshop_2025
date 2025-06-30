@@ -40,13 +40,18 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
+
+def _timestamp() -> str:
+    """Generate a timestamp string for print statements."""
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
 # SmolAgents imports
 try:
     from smolagents import CodeAgent, OpenAIServerModel, LiteLLMModel, InferenceClientModel
     SMOLAGENTS_AVAILABLE = True
 except ImportError:
     SMOLAGENTS_AVAILABLE = False
-    print("⚠ SmolAgents not available. Install with: uv add smolagents")
+    print(f"[{_timestamp()}] ⚠ SmolAgents not available. Install with: uv add smolagents")
 
 # Add parent directories to path for imports
 current_dir = Path(__file__).parent
@@ -57,8 +62,9 @@ from ur.config.voice_config import VoiceAgentConfig, load_config_from_env
 from ur.ui.console import VoiceAgentStatus
 from ur.agents.voice_common.audio import SimpleVoiceProcessor
 from ur.tools import register_tools_for_smolagents
-from ur.agents.shared_prompts import get_system_prompt
+from ur.config.system_prompts import get_system_prompt
 from ur.config.system_config import SMOL_MODEL_ID, SMOL_PROVIDER
+from ur.config.robot_config import ROBOT_AGENT_NAME
 
 
 class EventType(Enum):
@@ -220,7 +226,7 @@ class SmolAgentVoiceSession:
         try:
             system_prompt = get_system_prompt("code")
         except:
-            system_prompt = "You are UR-HAL-9000, a sophisticated AI assistant controlling a Universal Robot using code generation."
+            system_prompt = f"You are {ROBOT_AGENT_NAME}, a sophisticated AI assistant controlling a Universal Robot using code generation."
         
         prompt = f"""{system_prompt}
 
@@ -230,7 +236,7 @@ User request: "{user_text}"
 
 IMPORTANT INSTRUCTIONS:
 1. Generate Python code that uses the available robot tools to fulfill the user's request
-2. ALL robot movements require the wake phrase "timbra" to be mentioned by the user
+2. ALL robot movements require the wake phrase "mave" to be mentioned by the user
 3. If no wake phrase is present, politely ask the user to include it for safety
 4. Use send_immediate_response() to provide real-time feedback during long operations
 5. Always check robot state before attempting movements
@@ -315,8 +321,17 @@ Available tools are already imported and ready to use. Write clean, safe code.""
                         self.status.print_message("❌ Failed to transcribe audio", "red")
                         continue
                     
-                    if transcript.lower() in ['quit', 'exit', 'stop']:
+                    # Special handling: 'quit'/'exit' stops voice input, 'stop' triggers end_fabrication
+                    lower = transcript.lower()
+                    if lower in ['quit', 'exit']:
                         self.status.print_message("👋 Voice input stopped", "yellow")
+                        break
+                    if lower in ['stop', 'stop fabrication', 'end fabrication']:
+                        self.status.print_message("👋 Stop command received, ending fabrication...", "yellow")
+                        # Trigger end_fabrication command via bridge
+                        from ur.config.system_config import COMMAND_END
+                        if self.bridge:
+                            self.bridge.process_command({'data': COMMAND_END})
                         break
                     
                     # Process the voice command
@@ -353,7 +368,7 @@ Available tools are already imported and ready to use. Write clean, safe code.""
             
             while self.conversation_active:
                 try:
-                    print("\n💬 Type command: ", end="", flush=True)
+                    print(f"\n[{_timestamp()}] 💬 Type command: ", end="", flush=True)
                     text_input = await loop.run_in_executor(
                         None, 
                         lambda: sys.stdin.readline().strip()
@@ -441,14 +456,16 @@ class SmolVoiceAgent(BaseVoiceAgent):
         # Stop UI display with complete shutdown
         if self.ui:
             try:
-                if hasattr(self.ui, 'complete_shutdown'):
+                if hasattr(self.ui, 'force_shutdown'):
+                    self.ui.force_shutdown()  # Use force shutdown method
+                elif hasattr(self.ui, 'complete_shutdown'):
                     self.ui.complete_shutdown()  # Use aggressive shutdown method
                 else:
                     # Fallback to regular stop method
                     self.ui.stop_live_display()
                 self.ui.print_message("SmolAgent session stopped.", "yellow")
             except Exception as e:
-                print(f"⚠️ UI shutdown error: {e}")
+                print(f"[{_timestamp()}] ⚠️ UI shutdown error: {e}")
                 # Force basic stop
                 if hasattr(self.ui, 'is_stopped'):
                     self.ui.is_stopped = True
@@ -464,11 +481,9 @@ class SmolVoiceAgent(BaseVoiceAgent):
             
             # Generate appropriate commentary using system prompts
             if event_type == 'task_received':
-                prompt = build_commentary_prompt(
-                    context_type='task_execute',
-                    task_name=event_data.get('task_name')
-                )
-                commentary = await self._prompt_smol_for_commentary(prompt)
+                # Add NEW TASK decorator to indicate this is from task manager
+                task_context = f"[NEW TASK FROM MANAGER] Task: {event_data.get('task_name', 'unknown')}"
+                commentary = await self._prompt_smol_for_task_announcement(task_context)
                 
             elif event_type == 'command_received':
                 prompt = build_commentary_prompt(
@@ -493,7 +508,7 @@ class SmolVoiceAgent(BaseVoiceAgent):
             if commentary and commentary.strip():
                 send_immediate_response(commentary)
                 if self.config.debug_mode:
-                    print(f"🎭 [SMOL LLM COMMENTARY] {event_type}: {commentary}")
+                    print(f"[{_timestamp()}] 🎭 [SMOL LLM COMMENTARY] {event_type}: {commentary}")
                     
         except Exception as e:
             if self.config.debug_mode:
@@ -653,6 +668,51 @@ class SmolVoiceAgent(BaseVoiceAgent):
                 return f"Task {task_name} completed successfully."
         else:
             return f"Encountered an issue with {task_name}. Let me try again."
+
+    async def _prompt_smol_for_task_announcement(self, task_context: str) -> str:
+        """Generate commentary for task announcements."""
+        try:
+            if not self.session or not self.session.agent:
+                return "Executing task..."
+            
+            # Create a focused prompt for task announcement generation
+            task_prompt = f"""
+            {task_context}
+            
+            IMPORTANT: Generate ONLY a brief, natural robot announcement (under 15 words).
+            Do not include any code, explanations, or instructions.
+            Speak as the robot in first person.
+            """
+            
+            # Process through SmolAgent
+            response = await self.session.process_voice_command(task_prompt)
+            
+            # Extract just the commentary from the response (remove any code or extra text)
+            if response:
+                lines = response.split('\n')
+                # Find the most likely commentary line (short, natural language)
+                for line in lines:
+                    line = line.strip()
+                    if (line and 
+                        len(line.split()) <= 15 and 
+                        not line.startswith('```') and 
+                        not line.startswith('#') and
+                        not '=' in line and
+                        not 'import' in line.lower()):
+                        return line
+                
+                # Fallback: return first non-empty line
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('```'):
+                        return line[:100]  # Limit length
+            
+            return "Executing task..."
+            
+        except Exception as e:
+            if self.config.debug_mode:
+                print(f"❌ [SMOL LLM ERROR] {e}")
+            return "Executing task..."  # Fallback
 
 
 def create_smol_agent(bridge_ref, ui_ref, model_id: str = SMOL_MODEL_ID, provider: str = SMOL_PROVIDER, config: Optional[VoiceAgentConfig] = None) -> SmolVoiceAgent:

@@ -7,6 +7,7 @@ Environment Variables:
     Core Modes:
         TEXT_ONLY_MODE: Use text-only mode (true/false, default: false)
         ENABLE_TEXT_INPUT: Allow text input alongside voice (true/false, default: true)
+        ENABLE_HYBRID_MODE: Allow hybrid text & audio mode (true/false, default: true)
     
     Audio Behavior:
         ENABLE_INTERRUPTION: Allow interrupting assistant speech (true/false, default: true)
@@ -32,6 +33,7 @@ Environment Variables:
         VERBOSE_AGENT: Verbose agent output (true/false, default: true)
         ENABLE_TTS: Enable text-to-speech (true/false, default: false)
         TTS_VOICE: OpenAI TTS voice (default: alloy)
+        ENABLE_COMMENTARY_TTS: Enable spoken commentary for tasks (true/false, default: true)
 """
 
 import os
@@ -52,6 +54,7 @@ class VoiceAgentConfig:
     # Core interaction modes
     text_only_mode: bool = False  # Set True to disable voice and use text only
     enable_text_input: bool = True  # Allow text input alongside voice
+    enable_hybrid_mode: bool = True  # Allow hybrid text & audio mode
     
     # AI Model settings (primarily for SmolAgent)
     model_provider: str = "openai"  # openai, huggingface, litellm
@@ -59,17 +62,22 @@ class VoiceAgentConfig:
     
     # Audio behavior
     enable_interruption: bool = True  # Allow interrupting assistant speech
-    post_speech_delay: float = 0.8  # Extended delay after speaking to prevent feedback
+    post_speech_delay: float = 0.5  # Extended delay after speaking to prevent feedback
     
     # Enhanced audio feedback prevention
-    silence_after_speaking: float = 0.8  # Silence period after assistant stops speaking
-    audio_threshold: float = 0.005  # Minimum audio level to consider as speech (0.0-1.0)
+    silence_after_speaking: float = 0.5  # Silence period after assistant stops speaking
+    audio_threshold: float = 0.01  # Minimum audio level to consider as speech (0.0-1.0)
     feedback_prevention_enabled: bool = False  # Enable aggressive feedback prevention
     
     # Voice Activity Detection (VAD) settings for OpenAI Realtime API
     vad_threshold: float = 0.4  # VAD sensitivity threshold (0.0-1.0, higher = less sensitive)
     vad_silence_duration_ms: int = 500  # Milliseconds of silence before considering speech finished
     vad_prefix_padding_ms: int = 200  # Milliseconds of audio before speech detection
+    
+    # Silero VAD settings (more accurate local VAD)
+    silero_vad_threshold: float = 0.6  # Speech detection threshold (0.0-1.0) - higher = less sensitive
+    silero_min_speech_duration_ms: int = 500  # Minimum speech duration to register (increased to reduce false positives)
+    silero_min_silence_duration_ms: int = 500  # Silence before considering speech ended
     
     # Performance & debugging
     threaded_execution: bool = True  # Execute robot tools in background threads (unified name)
@@ -82,6 +90,7 @@ class VoiceAgentConfig:
     # TTS settings
     tts_voice: str = "alloy"  # OpenAI TTS voice
     enable_tts: bool = False  # Enable text-to-speech
+    enable_commentary_tts: bool = False  # Enable or disable task commentary audio
     
     # Session logging
     enable_logging: bool = False  # Enable session logging
@@ -90,8 +99,11 @@ class VoiceAgentConfig:
     # OpenAI Realtime specific settings
     openai_voice: str = "alloy"
     openai_temperature: float = 0.7
+    openai_voice_speed: float = 1.3
+    openai_vad_silence_ms: int = 200
     commentary_temperature: float = 0.3
     commentary_max_tokens: int = 50
+    openai_use_server_vad: bool = False  # whether to let OpenAI do server-side VAD
     
     @property
     def threaded_tools(self) -> bool:
@@ -110,6 +122,7 @@ class VoiceAgentConfig:
             # Core modes
             text_only_mode=_env_bool("TEXT_ONLY_MODE", False),
             enable_text_input=_env_bool("ENABLE_TEXT_INPUT", True),
+            enable_hybrid_mode=_env_bool("ENABLE_HYBRID_MODE", True),
             
             # AI Model settings
             model_provider=os.getenv("MODEL_PROVIDER", "openai"),
@@ -138,6 +151,7 @@ class VoiceAgentConfig:
             # TTS
             tts_voice=os.getenv("TTS_VOICE", "alloy"),
             enable_tts=_env_bool("ENABLE_TTS", False),
+            enable_commentary_tts=_env_bool("ENABLE_COMMENTARY_TTS", True),
             
             # Logging
             enable_logging=_env_bool("ENABLE_LOGGING", False),
@@ -146,8 +160,11 @@ class VoiceAgentConfig:
             # OpenAI Realtime specific
             openai_voice=os.getenv("OPENAI_VOICE", "alloy"),
             openai_temperature=_env_float("OPENAI_TEMPERATURE", 0.7),
+            openai_voice_speed=_env_float("OPENAI_VOICE_SPEED", 1.3),
+            openai_vad_silence_ms=_env_int("OPENAI_VAD_SILENCE_MS", 200),
             commentary_temperature=_env_float("COMMENTARY_TEMPERATURE", 0.3),
-            commentary_max_tokens=_env_int("COMMENTARY_MAX_TOKENS", 50)
+            commentary_max_tokens=_env_int("COMMENTARY_MAX_TOKENS", 50),
+            openai_use_server_vad=_env_bool("OPENAI_USE_SERVER_VAD", False)
         )
     
     def validate(self) -> None:
@@ -236,6 +253,7 @@ def load_config_from_env() -> VoiceAgentConfig:
         print(f"🔧 Voice Agent Configuration:")
         print(f"  Text-only mode: {config.text_only_mode}")
         print(f"  Text input enabled: {config.enable_text_input}")
+        print(f"  Hybrid mode: {config.enable_hybrid_mode}")
         print(f"  Model provider: {config.model_provider}")
         print(f"  Model ID: {config.model_id}")
         print(f"  Audio interruption: {config.enable_interruption}")

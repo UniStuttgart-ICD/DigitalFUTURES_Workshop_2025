@@ -68,11 +68,12 @@ class VoiceAgentStatus:
         # Fabrication state tracking
         self.fabrication_active = False
         
-        # Live display
+        # Live display and task management
         self.live: Optional[Live] = None
         self._animation_active = False
         self._animation_frame = 0
         self._status_displayed = False
+        self._animation_task: Optional[asyncio.Task] = None
         
         # Animation sequences
         self._listening_frames = ["🎤 ●", "🎤 ●●", "🎤 ●●●", "🎤 ●●", "🎤 ●"]
@@ -114,7 +115,7 @@ class VoiceAgentStatus:
             self.live.start()
             
             self._animation_active = True
-            asyncio.create_task(self._animation_loop())
+            self._animation_task = asyncio.create_task(self._animation_loop())
             
         except Exception as e:
             print(f"Animation start error: {e}")
@@ -122,8 +123,25 @@ class VoiceAgentStatus:
     async def stop_animation(self):
         """Stop the status animation."""
         self._animation_active = False
+        
+        # Cancel the animation task if it exists
+        if self._animation_task and not self._animation_task.done():
+            self._animation_task.cancel()
+            try:
+                await self._animation_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        
+        self._animation_task = None
+        
         if self.live:
-            self.live.stop()
+            try:
+                self.live.stop()
+                self.live = None
+            except Exception:
+                pass
     
     async def _animation_loop(self):
         """Main animation loop that updates the live status display."""
@@ -289,7 +307,7 @@ class VoiceAgentStatus:
         
         # Quick start info
         content_lines.append("🎤 [cyan]Speak naturally - I'll respond in real-time![/cyan]")
-        content_lines.append("💡 [yellow]Try saying: 'timbra move the robot forward'[/yellow]")
+        content_lines.append("💡 [yellow]Try saying: 'mave move the robot forward'[/yellow]")
         content_lines.append("🛑 [red]Press Ctrl+C to stop[/red]")
         content_lines.append("")
         
@@ -337,16 +355,48 @@ class VoiceAgentStatus:
             self.show_welcome_panel()
     
     def stop_live_display(self):
-        """Stop the status display."""
-        if self._animation_active:
-            asyncio.create_task(self.stop_animation())
+        """Stop the status display synchronously."""
+        self._animation_active = False
+        
+        # Cancel the animation task if it exists
+        if self._animation_task and not self._animation_task.done():
+            self._animation_task.cancel()
+        self._animation_task = None
+        
+        if self.live:
+            try:
+                self.live.stop()
+                self.live = None
+            except Exception:
+                pass
+        
+        # Force console cleanup
+        if self.console:
+            try:
+                # Flush any pending output
+                self.console.file.flush()
+                # Clear Rich's internal state
+                if hasattr(self.console, '_thread_pool'):
+                    try:
+                        self.console._thread_pool.shutdown(wait=False)
+                    except:
+                        pass
+            except Exception:
+                pass
     
     def collapse_to_compact(self):
         """Switch to compact status mode with animations."""
         self.show_initial_info = False
         if RICH_AVAILABLE and self.console:
             self.console.print("\n" + "─" * 80, style="dim")
-            asyncio.create_task(self.start_animation())
+            # Start animation in the current event loop if available
+            try:
+                loop = asyncio.get_running_loop()
+                if loop and not loop.is_closed():
+                    self._animation_task = asyncio.create_task(self.start_animation())
+            except RuntimeError:
+                # No event loop running, skip animation
+                pass
     
     # State management methods
     def update_status(self, status: str):
@@ -458,6 +508,34 @@ class VoiceAgentStatus:
         )
         task = progress.add_task("🔗 Connecting to services...", total=None)
         return progress, task
+
+    def force_shutdown(self):
+        """Force complete shutdown of all UI components."""
+        self._animation_active = False
+        
+        # Cancel the animation task if it exists
+        if self._animation_task and not self._animation_task.done():
+            self._animation_task.cancel()
+        self._animation_task = None
+        
+        if self.live:
+            try:
+                self.live.stop()
+            except Exception:
+                pass
+            finally:
+                self.live = None
+        
+        # Clear all references
+        self.console = None
+        
+        # Clear all state
+        self.is_listening = False
+        self.is_speaking = False
+        self.is_processing = False
+        self.is_generating_code = False
+        self.is_executing_code = False
+        self.tool_executing = None
 
 
 def create_status_manager(agent_name: str, agent=None, config=None) -> VoiceAgentStatus:

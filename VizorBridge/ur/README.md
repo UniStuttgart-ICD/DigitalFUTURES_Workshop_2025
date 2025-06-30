@@ -75,7 +75,7 @@ SMOL_PROVIDER=openai              # Options: openai, huggingface, litellm
 HF_TOKEN=your_hf_token_here       # For HuggingFace models
 
 # Safety
-WAKEWORD=timbra                   # Required wake word for robot movements
+WAKEWORD=mave                   # Required wake word for robot movements
 DEBUG=false
 ```
 
@@ -157,29 +157,29 @@ OPENAI_API_KEY=your_key_here
 
 ### Basic Commands
 ```
-"timbra move home"                    # Move robot to home position
-"timbra get robot state"              # Get current robot pose
-"timbra move up 5 centimeters"        # Relative movement
-"timbra open gripper"                 # Control gripper
-"timbra stop robot"                   # Emergency stop
+"mave move home"                    # Move robot to home position
+"mave get robot state"              # Get current robot pose
+"mave move up 5 centimeters"        # Relative movement
+"mave open gripper"                 # Control gripper
+"mave stop robot"                   # Emergency stop
 ```
 
 ### Advanced Commands
 ```
-"timbra move to position x 0.3 y 0.2 z 0.15"  # Absolute positioning
-"timbra get element from 20cm supply station"   # Pick up elements
-"timbra place element at x 0.4 y 0.1 z 0.2"    # Place elements
+"mave move to position x 0.3 y 0.2 z 0.15"  # Absolute positioning
+"mave get element from 20cm supply station"   # Pick up elements
+"mave place element at x 0.4 y 0.1 z 0.2"    # Place elements
 ```
 
 ### Safety Notes
-- **ALL robot movements require the wake word "timbra"**
+- **ALL robot movements require the wake word "mave"**
 - Commands without the wake word will be rejected
-- Emergency stop is available with "timbra stop robot"
+- Emergency stop is available with "mave stop robot"
 
 ## 🛡️ Safety Features
 
 ### Wake Word Validation
-All movement commands must include the wake word "timbra" for safety.
+All movement commands must include the wake word "mave" for safety.
 
 ### Safety Checks
 - Joint limit validation using UR RTDE safety functions
@@ -328,9 +328,9 @@ asyncio.run(robot_demo())
 # Start voice demo
 python ur/demo_smol_agent.py --mode voice
 
-# Say: "timbra move home"
-# Say: "timbra get element from 30cm supply station"
-# Say: "timbra place element at x 0.4 y 0.2 z 0.1"
+# Say: "mave move home"
+# Say: "mave get element from 30cm supply station"
+# Say: "mave place element at x 0.4 y 0.2 z 0.1"
 ```
 
 ## 🤝 Contributing

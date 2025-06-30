@@ -28,7 +28,7 @@ def test_tool_discovery():
 def test_utils():
     """Test shared utility functions in ur.utils."""
     print("\n🛠 Testing ur.utils:")
-    print(f"  validate_wakeword('timbra test'): {validate_wakeword('timbra test')}")
+    print(f"  validate_wakeword('mave test'): {validate_wakeword('mave test')}")
     print(f"  validate_wakeword('no'): {validate_wakeword('no')}")
     print("  send_immediate_response: ", end='')
     send_immediate_response("test command")

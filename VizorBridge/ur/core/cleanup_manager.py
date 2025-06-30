@@ -59,8 +59,18 @@ class SystemCleanupManager:
                           bridge=None, 
                           robot_connection=None,
                           ui=None):
-        """Register a component's cleanup methods in the appropriate phases."""
+        """
+        Register a component's cleanup methods, ensuring no duplicates.
+        This method is now idempotent.
+        """
         
+        with self.cleanup_lock:
+            # First, remove any existing cleanup tasks for this component to prevent duplicates
+            for phase in self.cleanup_tasks:
+                self.cleanup_tasks[phase] = [
+                    task for task in self.cleanup_tasks[phase] if not task.name.startswith(f"{component_name}_")
+                ]
+
         # Voice Agent Cleanup
         if voice_agent:
             # Use synchronous stop method if available to avoid event loop conflicts

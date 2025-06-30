@@ -19,6 +19,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Confirm
+import sys
+import os
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+from ur.config.robot_config import ROBOT_IP
 
 console = Console()
 
@@ -43,7 +49,7 @@ def run_cmd(command: str, capture_output: bool = True) -> tuple[int, str, str]:
     except Exception as e:
         return 1, "", str(e)
 
-def check_zombie_connections(robot_ip: str = "192.168.56.101") -> list[dict]:
+def check_zombie_connections(robot_ip: str) -> list[dict]:
     """Check for zombie RTDE connections to the robot."""
     console.print(f"🔍 Checking for zombie RTDE connections to {robot_ip}...")
     
@@ -191,7 +197,7 @@ def main():
         expand=False
     ))
     
-    robot_ip = "192.168.56.101"  # Default robot IP
+    robot_ip = ROBOT_IP
     
     # Step 1: Check for zombie connections
     connections = check_zombie_connections(robot_ip)

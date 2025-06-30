@@ -35,7 +35,7 @@ AUDIO_CONFIG = {
     "channels": 1,
     "format": "pcm16",
     "blocksize": 1024,
-    "duration": 5,  # Max recording duration in seconds
+    "duration": 0.3,  # Max recording duration in seconds
     "dtype": "int16",
 }
 
@@ -374,6 +374,32 @@ def convert_audio_to_numpy(audio_bytes: bytes) -> np.ndarray:
 
 
 def convert_numpy_to_audio(audio_array: np.ndarray) -> bytes:
-    """Convert numpy array back to audio bytes."""
-    audio_int16 = (audio_array * 32767).astype(np.int16)
-    return audio_int16.tobytes() 
+    """Convert numpy audio array back to bytes."""
+    return audio_array.astype(np.int16).tobytes()
+
+
+def play_audio(audio_data: bytes, device: Optional[int] = None):
+    """
+    Plays audio data using sounddevice in a separate thread.
+    
+    Args:
+        audio_data: Raw audio bytes to play.
+        device: The output device ID to use.
+    """
+    if not AUDIO_AVAILABLE:
+        print("Cannot play audio, sounddevice library not available.")
+        return
+
+    try:
+        # Create a stream for playback
+        stream = sd.RawOutputStream(
+            samplerate=AUDIO_CONFIG["samplerate"],
+            blocksize=AUDIO_CONFIG["blocksize"],
+            channels=AUDIO_CONFIG["channels"],
+            dtype=AUDIO_CONFIG["dtype"],
+            device=device
+        )
+        with stream:
+            stream.write(audio_data)
+    except Exception as e:
+        print(f"❌ Audio playback error: {e}") 

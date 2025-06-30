@@ -11,7 +11,7 @@ SMOL_MODEL_ID = "gpt-4o-mini"
 SMOL_PROVIDER = "openai"
 
 # Default OpenAI realtime model ID (overridable via environment)
-OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "gpt-4o-mini-realtime-preview-2024-12-17")
+OPENAI_MODEL_ID = "gpt-4o-realtime-preview"
 
 # OpenAI Realtime API constants
 OPENAI_TRANSCRIPTION_MODEL = "whisper-1"
@@ -22,210 +22,220 @@ TOOL_EXECUTOR_MAX_WORKERS = 2
 # Session management
 SESSION_ID_PREFIX = "session"
 
-# ROS bridge settings
-ROS_HOST = "localhost"
-ROS_PORT = 9090
 
 # Bridge command constants
-COMMAND_START = "START_FABRICATION"
-COMMAND_END = "END_FABRICATION"
+COMMAND_START = "start_fabrication"
+COMMAND_END = "end_fabrication"
 
 # Essential base status constants (cannot be generated dynamically)
-STATUS_FABRICATION_STARTED = "FABRICATION_STARTED"
-STATUS_FABRICATION_COMPLETE = "FABRICATION_COMPLETE"
-STATUS_MOVING_TO_SUPPLY = "MOVING_TO_SUPPLY"
-STATUS_AT_ASSEMBLY = "AT_ASSEMBLY"
-STATUS_GRIPPER_OPEN = "GRIPPER_OPEN"
-STATUS_GRIPPER_CLOSE = "GRIPPER_CLOSE"
+STATUS_FABRICATION_STARTED = "fabrication_started"
+STATUS_FABRICATION_COMPLETE = "fabrication_complete"
+STATUS_MOVING_TO_SUPPLY = "moving_to_supply"
+STATUS_AT_ASSEMBLY = "at_assembly"
+STATUS_GRIPPER_OPEN = "gripper_open"
+STATUS_GRIPPER_CLOSE = "gripper_close"
 
 # Additional status constants from PlantUML requirements
-STATUS_MOVING_TO_POSITION = "MOVING_TO_POSITION"
-STATUS_AT_TARGET_POSITION = "AT_TARGET_POSITION"
-STATUS_MOVING_TO_HOME = "MOVING_TO_HOME"
-STATUS_COMPLETE_ADJUST_POSITION = "COMPLETE_ADJUST_POSITION"
-STATUS_ELEMENT_RETRIEVED = "ELEMENT_RETRIEVED"
-STATUS_ELEMENT_PLACED = "ELEMENT_PLACED"
+STATUS_MOVING_TO_POSITION = "moving_to_position"
+STATUS_AT_TARGET_POSITION = "at_target_position"
+STATUS_MOVING_TO_HOME = "moving_to_home"
+STATUS_COMPLETE_ADJUST_POSITION = "complete_adjust_position"
+STATUS_ELEMENT_RETRIEVED = "element_retrieved"
+STATUS_ELEMENT_PLACED = "element_placed"
 
 # Dynamic Status Generation System
 # ================================
-# CRITICAL RULE: SUCCESS status messages must ONLY be sent at task completion!
-# Do not use SUCCESS for intermediate operations within a task.
+# CRITICAL RULE: success status messages must ONLY be sent at task completion!
+# Do not use success for intermediate operations within a task.
+
+STATUS_SUCCESS = "success"
+STATUS_FAILED = "failed"
+STATUS_STOP = "stop"
 
 def generate_status_message(
     action: str, 
     task_name: Optional[str] = None, 
     element_info: Optional[str] = None,
-    status_type: str = "INFO"
+    status_type: str = "info"
 ) -> str:
     """Generate dynamic status messages based on action and context.
     
     Args:
-        action: Base action being performed (e.g., "PICKUP", "PLACE", "MOVE")
-        task_name: Optional task name for context (e.g., "PickUp_40", "ReturnHome")
+        action: Base action being performed (e.g., "pickup", "place", "move")
+        task_name: Optional task name for context (e.g., "pickup_40", "returnhome")
         element_info: Optional element information (e.g., "40cm", "50cm")
-        status_type: Type of status message ("SUCCESS", "PROGRESS", "COMPLETE", "INFO", "ERROR")
+        status_type: Type of status message ("success", "progress", "complete", "info", "error")
     
     Returns:
         Formatted status message string
         
     Examples:
-        generate_status_message("PICKUP", "PickUp_40", status_type="SUCCESS") 
-        -> "SUCCESS_PickUp_40"  # ONLY at complete task success!
+        generate_status_message("pickup", "pickup_40", status_type="success") 
+        -> "success_pickup_40"  # ONLY at complete task success!
         
-        generate_status_message("MOVING", element_info="40cm", status_type="PROGRESS")
-        -> "MOVING_40CM_ELEMENT"
+        generate_status_message("moving", element_info="40cm", status_type="progress")
+        -> "moving_40cm_element"
         
-        generate_status_message("ADJUST_POSITION", status_type="COMPLETE")
-        -> "COMPLETE_ADJUST_POSITION"
+        generate_status_message("adjust_position", status_type="complete")
+        -> "complete_adjust_position"
         
-    WARNING: Only use status_type="SUCCESS" when the ENTIRE task is completed successfully!
+    WARNING: Only use status_type="success" when the ENTIRE task is completed successfully!
     """
     # Build base message
-    base_msg = action.upper()
+    base_msg = action.lower()
     
     # Add element information if provided
     if element_info:
-        # Clean element info (remove spaces, convert to uppercase)
-        clean_element = element_info.replace(" ", "").replace("cm", "CM").upper()
-        base_msg = f"{base_msg}_{clean_element}_ELEMENT"
+        # Clean element info (remove spaces, convert to lowercase)
+        clean_element = element_info.replace(" ", "").replace("cm", "cm").lower()
+        base_msg = f"{base_msg}_{clean_element}_element"
     
     # Add task name if provided (for specific task tracking)
     if task_name:
-        base_msg = f"{base_msg}_{task_name}" if not element_info else base_msg
+        base_msg = f"{base_msg}_{task_name.lower()}" if not element_info else base_msg
     
     # Apply status type prefix/suffix
-    if status_type == "SUCCESS":
-        return f"SUCCESS_{task_name}" if task_name else f"SUCCESS_{base_msg}"
-    elif status_type == "PROGRESS":
-        return f"{base_msg}_IN_PROGRESS"
-    elif status_type == "COMPLETE":
-        return f"COMPLETE_{base_msg}" if not base_msg.startswith("COMPLETE") else base_msg
-    elif status_type == "ERROR":
-        return f"ERROR_{base_msg}"
-    else:  # INFO or default
+    status_type = status_type.lower()
+    if status_type == "success":
+        return f"success_{task_name.lower()}" if task_name else f"success_{base_msg}"
+    elif status_type == "progress":
+        return f"{base_msg}_in_progress"
+    elif status_type == "complete":
+        return f"complete_{base_msg}" if not base_msg.startswith("complete") else base_msg
+    elif status_type == "error":
+        return f"error_{base_msg}"
+    else:  # info or default
         return base_msg
 
 def generate_movement_status(
     movement_type: str,
     target: Optional[str] = None,
-    status_type: str = "PROGRESS"
+    status_type: str = "progress"
 ) -> str:
     """Generate movement-specific status messages.
     
     Args:
-        movement_type: Type of movement ("LINEAR", "JOINT", "HOME", "RELATIVE", "ABSOLUTE")
-        target: Optional target description ("HOME", "SUPPLY", "ASSEMBLY", "40cm")
-        status_type: Status type ("PROGRESS", "COMPLETE", "SUCCESS")
+        movement_type: Type of movement ("linear", "joint", "home", "relative", "absolute")
+        target: Optional target description ("home", "supply", "assembly", "40cm")
+        status_type: Status type ("progress", "complete", "success")
     
     Returns:
         Movement-specific status message
         
     Examples:
-        generate_movement_status("LINEAR", "SUPPLY") -> "MOVING_TO_SUPPLY"
-        generate_movement_status("HOME", status_type="COMPLETE") -> "AT_HOME_POSITION"
+        generate_movement_status("linear", "supply") -> "moving_to_supply"
+        generate_movement_status("home", status_type="complete") -> "at_home_position"
     """
-    if movement_type.upper() == "HOME":
-        if status_type == "PROGRESS":
-            return "MOVING_TO_HOME"
-        elif status_type in ["COMPLETE", "SUCCESS"]:
-            return "AT_HOME_POSITION"
+    movement_type = movement_type.lower()
+    status_type = status_type.lower()
+
+    if movement_type == "home":
+        if status_type == "progress":
+            return "moving_to_home"
+        elif status_type in ["complete", "success"]:
+            return "at_home_position"
     
     if target:
-        target_upper = target.upper()
-        if status_type == "PROGRESS":
-            return f"MOVING_TO_{target_upper}"
-        elif status_type in ["COMPLETE", "SUCCESS"]:
-            return f"AT_{target_upper}"
+        target_lower = target.lower()
+        if status_type == "progress":
+            return f"moving_to_{target_lower}"
+        elif status_type in ["complete", "success"]:
+            return f"at_{target_lower}"
     
     # Fallback for generic movement
-    if status_type == "PROGRESS":
-        return f"MOVING_{movement_type.upper()}"
-    elif status_type in ["COMPLETE", "SUCCESS"]:
-        return f"{movement_type.upper()}_COMPLETE"
+    if status_type == "progress":
+        return f"moving_{movement_type}"
+    elif status_type in ["complete", "success"]:
+        return f"{movement_type}_complete"
     
-    return f"{movement_type.upper()}_MOVEMENT"
+    return f"{movement_type}_movement"
 
-def generate_gripper_status(action: str, status_type: str = "COMPLETE") -> str:
+def generate_gripper_status(action: str, status_type: str = "complete") -> str:
     """Generate gripper-specific status messages.
     
     Args:
-        action: Gripper action ("OPEN", "CLOSE", "GRAB", "RELEASE")
-        status_type: Status type ("PROGRESS", "COMPLETE", "SUCCESS")
+        action: Gripper action ("open", "close", "grab", "release")
+        status_type: Status type ("progress", "complete", "success")
     
     Returns:
         Gripper-specific status message
     """
-    action_upper = action.upper()
+    action_lower = action.lower()
+    status_type = status_type.lower()
     
-    if status_type == "PROGRESS":
-        return f"GRIPPER_{action_upper}_IN_PROGRESS"
-    elif status_type in ["COMPLETE", "SUCCESS"]:
-        return f"GRIPPER_{action_upper}"
+    if status_type == "progress":
+        return f"gripper_{action_lower}_in_progress"
+    elif status_type in ["complete", "success"]:
+        return f"gripper_{action_lower}"
     else:
-        return f"GRIPPER_{action_upper}_{status_type.upper()}"
+        return f"gripper_{action_lower}_{status_type}"
 
-def generate_task_status(task_name: str, status_type: str = "PROGRESS") -> str:
+def generate_task_status(task_name: str, status_type: str = "progress") -> str:
     """Generate task-specific status messages.
     
     Args:
-        task_name: Name of the task (e.g., "CheckElements", "PickUp_40")
-        status_type: Status type ("SUCCESS", "PROGRESS", "COMPLETE", "ERROR")
+        task_name: Name of the task (e.g., "checkelements", "pickup_40")
+        status_type: Status type ("success", "progress", "complete", "error")
     
     Returns:
         Task-specific status message
         
     Examples:
-        generate_task_status("PickUp_40", "SUCCESS") -> "SUCCESS_PickUp_40"  # ONLY at task completion
-        generate_task_status("CheckElements", "PROGRESS") -> "CheckElements_IN_PROGRESS"
+        generate_task_status("pickup_40", "success") -> "success_pickup_40"  # ONLY at task completion
+        generate_task_status("checkelements", "progress") -> "checkelements_in_progress"
     
     Note:
-        SUCCESS status should ONLY be used when the entire task is completed successfully.
-        Use PROGRESS for intermediate operations within a task.
+        success status should ONLY be used when the entire task is completed successfully.
+        Use progress for intermediate operations within a task.
     """
-    if status_type == "SUCCESS":
-        return f"SUCCESS_{task_name}"
-    elif status_type == "PROGRESS":
-        return f"{task_name}_IN_PROGRESS"
-    elif status_type == "COMPLETE":
-        return f"{task_name}_COMPLETE"
-    elif status_type == "ERROR":
-        return f"ERROR_{task_name}"
+    task_name = task_name.lower()
+    status_type = status_type.lower()
+
+    if status_type == "success":
+        return f"success_{task_name}"
+    elif status_type == "progress":
+        return f"{task_name}_in_progress"
+    elif status_type == "complete":
+        return f"{task_name}_complete"
+    elif status_type == "error":
+        return f"error_{task_name}"
     else:
-        return f"{task_name}_{status_type.upper()}"
+        return f"{task_name}_{status_type}"
 
 def generate_supply_status(
     element_length: str,
-    action: str = "RETRIEVE",
-    status_type: str = "SUCCESS"
+    action: str = "retrieve",
+    status_type: str = "success"
 ) -> str:
     """Generate supply station status messages.
     
     Args:
         element_length: Length of element (e.g., "40cm", "50cm")
-        action: Supply action ("RETRIEVE", "PLACE", "GET")
-        status_type: Status type ("SUCCESS", "PROGRESS", "COMPLETE")
+        action: Supply action ("retrieve", "place", "get")
+        status_type: Status type ("success", "progress", "complete")
     
     Returns:
         Supply-specific status message
         
     Examples:
-        generate_supply_status("40cm", "RETRIEVE", "SUCCESS") -> "SUCCESS_RETRIEVE_40CM_ELEMENT"
-        generate_supply_status("50cm", "PLACE", "PROGRESS") -> "PLACING_50CM_ELEMENT"
+        generate_supply_status("40cm", "retrieve", "success") -> "success_retrieve_40cm_element"
+        generate_supply_status("50cm", "place", "progress") -> "placing_50cm_element"
     """
     # Clean element length
-    clean_length = element_length.replace(" ", "").replace("cm", "CM").upper()
-    action_upper = action.upper()
+    clean_length = element_length.replace(" ", "").replace("cm", "cm").lower()
+    action_lower = action.lower()
+    status_type = status_type.lower()
     
-    if status_type == "SUCCESS":
-        return f"SUCCESS_{action_upper}_{clean_length}_ELEMENT"
-    elif status_type == "PROGRESS":
-        if action_upper == "RETRIEVE":
-            return f"RETRIEVING_{clean_length}_ELEMENT"
-        elif action_upper == "PLACE":
-            return f"PLACING_{clean_length}_ELEMENT"
+    if status_type == "success":
+        return f"success_{action_lower}_{clean_length}_element"
+    elif status_type == "progress":
+        if action_lower == "retrieve":
+            return f"retrieving_{clean_length}_element"
+        elif action_lower == "place":
+            return f"placing_{clean_length}_element"
         else:
-            return f"{action_upper}ING_{clean_length}_ELEMENT"
-    elif status_type == "COMPLETE":
-        return f"{action_upper}_{clean_length}_ELEMENT_COMPLETE"
+            return f"{action_lower}ing_{clean_length}_element"
+    elif status_type == "complete":
+        return f"{action_lower}_{clean_length}_element_complete"
     else:
-        return f"{action_upper}_{clean_length}_ELEMENT_{status_type.upper()}" 
+        return f"{action_lower}_{clean_length}_element_{status_type}" 

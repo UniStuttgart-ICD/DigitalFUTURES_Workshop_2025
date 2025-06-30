@@ -105,12 +105,13 @@ def _cleanup_rtde_interfaces():
 class URConnection:
     """RTDE connection manager for UR robot."""
     
-    def __init__(self, robot_ip: str = "192.168.56.101"):
+    def __init__(self, robot_ip: str):
         self.robot_ip = robot_ip
         self.rtde_c: Optional[Any] = None
         self.rtde_r: Optional[Any] = None
         self.rtde_io: Optional[Any] = None
         self.is_connected = False
+        self._is_shutting_down = False
         self._connect()
     
     def _connect(self):
@@ -219,172 +220,66 @@ class URConnection:
             return None
     
     def wait_for_movement_completion(self, timeout: float = 60.0, show_progress: bool = True) -> bool:
-        """Wait for robot movement to complete using smart detection methods.
-        
-        Uses multiple detection methods for robust movement completion detection:
-        1. Primary: getAsyncOperationProgress() for real-time 0-100% completion
-        2. Secondary: isSteady() with velocity verification 
-        3. Tertiary: isProgramRunning() for program state awareness
-        4. Quaternary: Velocity-based detection using getActualQd()
-        
-        Args:
-            timeout: Maximum time to wait in seconds (increased to 60s for slow movements)
-            show_progress: Whether to display progress updates
-            
-        Returns:
-            True if movement completed, False if timeout or error
-        """
-        if not self.ensure_connected() or not self.rtde_c:
-            return False
-            
         import time
-        start_time = time.time()
-        last_progress = -1
-        consecutive_steady_checks = 0
-        steady_required = 3  # Require 3 consecutive steady checks for reliability
-        
-        try:
-            # Wait a short time to ensure movement has started
-            time.sleep(0.1)
-            
-            while time.time() - start_time < timeout:
-                elapsed = time.time() - start_time
-                
-                # Method 1: Primary - getAsyncOperationProgress() 
-                try:
-                    progress = self.rtde_c.getAsyncOperationProgress()
-                    if progress is not None:
-                        # Progress is 0-100, where 100 means completed
-                        if show_progress and int(progress) != last_progress and int(progress) % 10 == 0:
-                            console.print(f"[blue]📈[/blue] Movement progress: {int(progress)}%")
-                            last_progress = int(progress)
-                        
-                        if progress >= 100.0:
-                            console.print(f"[green]✓[/green] Movement completed (progress: 100%)")
-                            return True
-                        
-                        # If we have good progress data, continue monitoring
-                        time.sleep(0.1)
-                        continue
-                except Exception as e:
-                    # getAsyncOperationProgress might not be available, fall back to other methods
-                    if elapsed < 1.0:  # Only log this once early on
-                        console.print(f"[yellow]⚠[/yellow] Progress monitoring unavailable, using fallback methods")
-                
-                # Method 2: Secondary - Enhanced isSteady() with velocity check
-                try:
-                    is_steady = self.rtde_c.isSteady()
-                    velocities = self.rtde_r.getActualQd() if self.rtde_r else None
-                    
-                    # Check if robot is steady AND velocities are near zero
-                    velocity_near_zero = True
-                    if velocities and len(velocities) == 6:
-                        # Check if all joint velocities are below threshold (rad/s)
-                        velocity_threshold = 0.01  # Very small velocity threshold
-                        velocity_near_zero = all(abs(v) < velocity_threshold for v in velocities)
-                    
-                    if is_steady and velocity_near_zero:
-                        consecutive_steady_checks += 1
-                        if consecutive_steady_checks >= steady_required:
-                            console.print(f"[green]✓[/green] Movement completed (steady + zero velocity)")
-                            return True
-                    else:
-                        consecutive_steady_checks = 0
-                        
-                except Exception as e:
-                    console.print(f"[yellow]⚠[/yellow] Steady check failed: {e}")
-                
-                # Method 3: Tertiary - Program running state check
-                try:
-                    # If no program is running, movement should be done
-                    program_running = self.rtde_c.isProgramRunning()
-                    if program_running is False:
-                        # Double-check with steady state
-                        if self.rtde_c.isSteady():
-                            console.print(f"[green]✓[/green] Movement completed (no program running + steady)")
-                            return True
-                except Exception:
-                    pass  # This method is optional
-                
-                # Show periodic updates for long movements
-                if show_progress and elapsed > 10 and int(elapsed) % 10 == 0:
-                    console.print(f"[blue]⏱[/blue] Still moving... {int(elapsed)}s elapsed")
-                
-                time.sleep(0.1)  # Check every 100ms for responsiveness
-                
-            # Timeout reached - try final verification and diagnostics
-            console.print(f"[yellow]⚠[/yellow] Movement timeout after {timeout}s, doing final checks...")
-            
-            # Final verification: Check if robot is actually steady despite timeout
+        start = time.time()
+        last_pct = -1.0
+
+        # Short initial sleep to let the move start
+        time.sleep(0.1)
+
+        while time.time() - start < timeout:
+            # Primary: Ex version
             try:
-                is_steady = self.rtde_c.isSteady()
-                velocities = self.rtde_r.getActualQd() if self.rtde_r else None
-                program_running = self.rtde_c.isProgramRunning()
-                
-                # Check robot status for safety issues
-                robot_status = None
-                safety_status = None
-                try:
-                    robot_status = self.rtde_c.getRobotStatus() if hasattr(self.rtde_c, 'getRobotStatus') else None
-                    safety_status = self.rtde_r.getSafetyStatusBits() if self.rtde_r else None
-                except:
-                    pass
-                
-                if is_steady and velocities and all(abs(v) < 0.01 for v in velocities):
-                    console.print(f"[green]✓[/green] Movement actually completed (post-timeout verification)")
+                status = self.rtde_c.getAsyncOperationProgressEx()
+                if show_progress:
+                    pct = int(status.progress * 100)
+                    if pct != last_pct and pct % 10 == 0:
+                        console.print(f"[blue]📈[/blue] Move progress: {pct}%")
+                        last_pct = pct
+                if status.completed:
+                    console.print("[green]✓[/green] Movement completed")
                     return True
-                
-                # Diagnose why movement failed
-                console.print(f"[blue]🔍[/blue] Movement failure diagnostics:")
-                console.print(f"  - Robot steady: {is_steady}")
-                console.print(f"  - Program running: {program_running}")
-                
-                if velocities:
-                    max_vel = max(abs(v) for v in velocities)
-                    console.print(f"  - Max joint velocity: {max_vel:.4f} rad/s")
-                else:
-                    console.print(f"  - Joint velocities: unavailable")
-                
-                # Check for safety issues
-                if safety_status is not None:
-                    if safety_status & 0x4:  # Bit 2: Protective stopped
-                        console.print(f"[red]🛡[/red] Robot is in PROTECTIVE STOP - likely collision detected!")
-                    elif safety_status & 0x10:  # Bit 4: Safeguard stopped
-                        console.print(f"[yellow]🛡[/yellow] Robot is in SAFEGUARD STOP")
-                    elif safety_status & 0x100:  # Bit 8: Emergency stopped
-                        console.print(f"[red]🚨[/red] Robot is in EMERGENCY STOP")
-                    elif safety_status & 0x200:  # Bit 9: Violation
-                        console.print(f"[red]⚠[/red] Safety violation detected")
-                    elif safety_status & 0x400:  # Bit 10: Fault
-                        console.print(f"[red]⚠[/red] Safety fault detected")
-                    else:
-                        console.print(f"  - Safety status: 0x{safety_status:04x} (normal)")
-                
-                if robot_status is not None:
-                    if not (robot_status & 0x1):  # Bit 0: Power on
-                        console.print(f"[red]⚡[/red] Robot power is OFF")
-                    if robot_status & 0x2:  # Bit 1: Program running
-                        console.print(f"[blue]📋[/blue] Program still running")
-                
-                # Provide helpful suggestions
-                if program_running:
-                    console.print(f"[red]⚠[/red] Robot still executing movement after timeout!")
-                    console.print(f"[yellow]💡[/yellow] Suggestion: Increase timeout or check for obstacles")
-                else:
-                    console.print(f"[yellow]⚠[/yellow] Robot stopped but may not have reached target")
-                    if safety_status and (safety_status & 0x4):
-                        console.print(f"[yellow]💡[/yellow] Suggestion: Check for self-collision or workspace limits")
-                    else:
-                        console.print(f"[yellow]💡[/yellow] Suggestion: Check target position validity or increase speeds")
-                    
-            except Exception as e:
-                console.print(f"[red]✗[/red] Final verification failed: {e}")
-            
-            return False
-            
-        except Exception as e:
-            console.print(f"[red]✗[/red] Error waiting for movement: {e}")
-            return False
+                time.sleep(0.1)
+                continue
+            except Exception:
+                # If not supported, fall back
+                pass
+
+            # Fallback: basic progress
+            try:
+                prog = self.rtde_c.getAsyncOperationProgress()
+                # Show raw percentage if available
+                if show_progress and isinstance(prog, (int, float)):
+                    pct = int(prog)
+                    if pct != last_pct and pct % 10 == 0:
+                        console.print(f"[blue]📈[/blue] Move progress: {pct}%")
+                        last_pct = pct
+                # Completion signals: negative or full 100%
+                if prog is not None and (prog < 0 or prog >= 100):
+                    console.print("[green]✓[/green] Movement completed (fallback)")
+                    return True
+                time.sleep(0.1)
+                continue
+            except Exception:
+                pass
+
+            # Velocity check
+            speed = self.rtde_r.getActualTCPSpeed() if self.rtde_r else None
+            frac  = self.rtde_r.getTargetSpeedFraction() if self.rtde_r else None
+            if speed is not None and speed < 1e-3 and frac is not None and frac == 0.0:
+                console.print("[green]✓[/green] Movement completed (velocity)")
+                return True
+
+            # Steady & program check
+            if self.rtde_c.isSteady() and not self.rtde_c.isProgramRunning():
+                console.print("[green]✓[/green] Movement completed (steady & idle)")
+                return True
+
+            time.sleep(0.1)
+
+        console.print(f"[yellow]⚠[/yellow] Timeout after {timeout}s")
+        return False
+
     
     def move_l(self, pose: List[float], speed: float = 0.25, acceleration: float = 1.2) -> bool:
         """Move robot linearly to target pose."""
@@ -411,28 +306,23 @@ class URConnection:
             return False
     
     def cleanup(self):
-        """Clean up connections."""
-        try:
-            if self.rtde_c:
-                # Stop any running scripts and movements
-                try:
-                    self.rtde_c.stopL()  # Stop linear movements
-                    self.rtde_c.stopJ()  # Stop joint movements
-                    console.print("[yellow]🛑[/yellow] Robot movements stopped")
-                except:
-                    pass
-                
-                try:
-                    self.rtde_c.stopScript()  # Stop any running scripts
-                    console.print("[yellow]📄[/yellow] Robot scripts stopped")
-                except:
-                    pass
-        except:
-            pass
-        finally:
-            self.is_connected = False
-            self._cleanup_connections()
-            console.print("[green]✅[/green] Robot connection cleaned up")
+        """Gracefully stop robot and clean up connections."""
+        console.print("[yellow]🧹[/yellow] Cleaning up robot connection...")
+        self._is_shutting_down = True
+        
+        # Stop any running scripts or movements safely
+        if self.rtde_c and self.is_connected:
+            try:
+                if self.rtde_c.isProgramRunning():
+                    self.rtde_c.stopScript()
+                    console.print("[blue]🛑[/blue] Robot scripts stopped")
+            except Exception as e:
+                console.print(f"[red]✗[/red] Failed to stop robot script during cleanup: {e}")
+        
+        # Clean up local RTDE interface references
+        self._cleanup_connections()
+        self.is_connected = False
+        console.print("[green]✓[/green] Robot connection cleaned up")
 
 
 # Global robot instance management

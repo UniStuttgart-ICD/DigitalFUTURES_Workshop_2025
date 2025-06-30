@@ -47,7 +47,7 @@ def control_gripper(rtde_io_interface, open_gripper: bool = True) -> None:
     console.print(f"[green]✓[/green] Gripper {action} command sent, waiting {wait_time}s...")
     time.sleep(wait_time)
 
-def main(robot_ip: str = "192.168.56.101") -> None:
+def main(robot_ip: str) -> None:
     """Simple connectivity check with a UR robot via RTDE including gripper control."""
     console.print(Panel(f"[bold cyan]RTDE Connection & Gripper Test[/bold cyan]\nRobot IP: {robot_ip}", expand=False))
     

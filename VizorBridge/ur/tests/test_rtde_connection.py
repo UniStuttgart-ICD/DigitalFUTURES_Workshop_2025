@@ -10,8 +10,11 @@ from rich.panel import Panel
 # Import robot configuration directly to avoid circular imports
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'config'))
-from robot_config import (
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from ur.config.robot_config import ROBOT_IP
+
+from ur.config.robot_config import (
     GRIPPER_DIGITAL_OUT, 
     GRIPPER_OPEN_STATE, 
     GRIPPER_CLOSE_STATE,
@@ -44,7 +47,7 @@ def control_gripper(rtde_io_interface, open_gripper: bool = True) -> None:
     console.print(f"[green]✓[/green] Gripper {action} command sent, waiting {wait_time}s...")
     time.sleep(wait_time)
 
-def main(robot_ip: str = "192.168.56.101") -> None:
+def main(robot_ip: str) -> None:
     """Simple connectivity check with a UR robot via RTDE including gripper control."""
     console.print(Panel(f"[bold cyan]RTDE Connection & Gripper Test[/bold cyan]\nRobot IP: {robot_ip}", expand=False))
     
@@ -106,5 +109,5 @@ def main(robot_ip: str = "192.168.56.101") -> None:
 if __name__ == "__main__":
     import sys
 
-    ip = sys.argv[1] if len(sys.argv) > 1 else "192.168.56.101"
+    ip = sys.argv[1] if len(sys.argv) > 1 else ROBOT_IP
     main(ip)

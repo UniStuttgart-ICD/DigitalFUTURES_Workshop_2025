@@ -17,11 +17,11 @@ from ur.config.system_config import (
     VOICE_ENABLED,
     SMOL_MODEL_ID,
     SMOL_PROVIDER,
-    ROS_HOST,
-    ROS_PORT,
+
 )
 from ur.config.robot_config import ROBOT_NAME, ROBOT_IP
 from ur.config.voice_config import load_config_from_env
+from ur.config.topics import     ROS_HOST,ROS_PORT
 
 
 class URVoiceSystem:
@@ -67,8 +67,8 @@ class URVoiceSystem:
         # Register components with cleanup manager for coordinated shutdown
         self._register_with_cleanup_manager()
         
-        # Display idle status
-        self.ui.print_message("🛌 System initialized and waiting for START_FABRICATION command...", style="cyan bold")
+        # Display idle status (updated)
+        self.ui.print_message("🛌 System initialized and ready to receive ROS tasks and commands...", style="cyan bold")
 
     def _load_env(self):
         # .env loading removed; configuration is handled in config modules
@@ -163,7 +163,7 @@ class URVoiceSystem:
         except Exception as e:
             self.ui.print_message(f"⚠️ Could not register with cleanup manager: {e}", style="yellow")
 
-    def create_agent(self) -> BaseVoiceAgent | None:
+    def create_voice_agent(self, bridge: URBridge) -> BaseVoiceAgent | None:
         """Create and return a voice agent instance. Called by bridge on START_FABRICATION."""
         if not self.voice_enabled:
             self.ui.print_message("Voice agent is disabled (VOICE_ENABLED=false).", style="dim")
@@ -175,14 +175,14 @@ class URVoiceSystem:
 
         self.ui.update_status(f"Creating '{self.agent_type}' voice agent...")
         
-        # Create new agent instance
+        # Pass the bridge reference to the agent constructor
         self.agent = self._initialize_agent()
         
-        # Register with bridge for task notifications
-        if self.agent and self.bridge:
-            self.bridge.set_agent_reference(self.agent)
+        # Register agent with the bridge that created it
+        if self.agent and bridge:
+            bridge.set_agent_reference(self.agent)
         
-        # Re-register with cleanup manager now that we have an agent
+        # Re-register with cleanup manager now that we have an agent instance
         self._register_with_cleanup_manager()
             
         return self.agent
@@ -275,21 +275,9 @@ class URVoiceSystem:
         
         # Use the centralized cleanup manager for coordinated shutdown
         try:
-            import asyncio
-            from ur.core.cleanup_manager import cleanup_system
+            from ur.core.cleanup_manager import cleanup_system_sync
 
-            # Handle different event loop contexts
-            try:
-                # Check if we're in an existing event loop
-                loop = asyncio.get_running_loop()
-                # If we're in a running loop, run cleanup in a separate thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, cleanup_system())
-                    future.result(timeout=15)
-            except RuntimeError:
-                # No running loop, run cleanup directly
-                asyncio.run(cleanup_system())
+            cleanup_system_sync()
 
             self.ui.print_message("✅ UR Voice System shutdown complete.", "green")
         except Exception as e:
@@ -299,7 +287,7 @@ class URVoiceSystem:
         
         # Clear references
         self.bridge = None
-        self.voice_agent = None
+        self.agent = None
 
 
 def create_enhanced_voice_system(client: roslibpy.Ros, show_config: bool = True) -> URVoiceSystem:

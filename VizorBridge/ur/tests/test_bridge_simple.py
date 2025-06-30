@@ -20,8 +20,9 @@ import os
 import math
 import threading
 from rich.console import Console
-from rich.progress import Progress, TaskID, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+from rich.progress import Progress, TaskID, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn, TimeElapsedColumn
 from rich.live import Live
+from rich.errors import LiveError
 from rich.panel import Panel
 from rich.text import Text
 
@@ -31,6 +32,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from RobotInterface import RobotInterface
 from ur.core.connection import get_robot, set_bridge
 from ur.config.robot_config import (
+    ROBOT_NAME,
     ROBOT_IP,
     ROBOT_MOVE_SPEED,
     ROBOT_ACCELERATION,
@@ -51,6 +53,7 @@ from ur.config.topics import (
     TASK_EXECUTE_MSG_TYPE,
     STD_STRING_MSG_TYPE,
     POSITION_MSG_TYPE,
+    ROS_HOST
 )
 from ur.config.system_config import (
     COMMAND_START,
@@ -60,6 +63,9 @@ from ur.config.system_config import (
     STATUS_GRIPPER_OPEN,
     STATUS_GRIPPER_CLOSE,
     generate_task_status,
+    STATUS_SUCCESS,
+    STATUS_FAILED,
+    generate_movement_status,
 )
 from ur.tools.gripper_tools import _set_gripper_output
 
@@ -77,7 +83,7 @@ class SimpleBridge(RobotInterface):
 
     def __init__(
         self,
-        name: str = "SimpleBridge",
+        name: str = ROBOT_NAME,
         client: roslibpy.Ros = None,
         robot_ip: str | None = None,
         task_topic: str = TASK_EXECUTE_TOPIC,
@@ -139,7 +145,7 @@ class SimpleBridge(RobotInterface):
     def publish_status(self, status_message: str):
         """Publish robot status updates."""
         try:
-            self.status_publisher.publish(roslibpy.Message({'data': status_message}))
+            self.status_publisher.publish({'data': status_message})
             print(f"📡 [STATUS] {status_message}")
         except Exception as e:
             print(f"❌ [STATUS ERROR] {e}")
@@ -163,7 +169,7 @@ class SimpleBridge(RobotInterface):
                     'velocity': [],
                     'effort': []
                 }
-                self.position_publisher.publish(roslibpy.Message(joint_state_msg))
+                self.position_publisher.publish(joint_state_msg)
         except Exception as e:
             print(f"❌ [POSITION ERROR] {e}")
 
@@ -231,6 +237,12 @@ class SimpleBridge(RobotInterface):
         elif command == "stop":
             self.console.print("   🛑 Executing: Stop robot operations")
             self.stop_robot()
+        elif command == "gripper_open":
+            self.console.print("   🔓 Executing: Open gripper")
+            self.control_gripper("open")
+        elif command == "gripper_close":
+            self.console.print("   🔒 Executing: Close gripper")
+            self.control_gripper("close")
         elif command == "home":
             self.console.print("   🏠 Executing: Move to home position")
             self.go_to_home()
@@ -293,10 +305,47 @@ class SimpleBridge(RobotInterface):
             return False
         try:
             home_joints_rad = [math.radians(angle) for angle in HOME_POSITION]
-            success = self.robot_connection.move_j(home_joints_rad, ROBOT_HOME_SPEED, ROBOT_HOME_ACCELERATION)
-            if success:
-                self.publish_joint_state()
-            return success
+
+            # Run in background so UI stays responsive
+            def _home_move():
+                try:
+                    if hasattr(self.robot_connection, "rtde_c") and self.robot_connection.rtde_c:
+                        # Start asynchronous move
+                        self.robot_connection.rtde_c.moveJ(
+                            home_joints_rad,
+                            ROBOT_HOME_SPEED,
+                            ROBOT_HOME_ACCELERATION,
+                            asynchronous=True,
+                        )
+                        # Wait until it actually finishes (no progress bar)
+                        self.robot_connection.wait_for_movement_completion(
+                            timeout=90, show_progress=False
+                        )
+                    else:
+                        # Fallback helper – already blocks internally
+                        self.robot_connection.move_j(
+                            home_joints_rad,
+                            ROBOT_HOME_SPEED,
+                            ROBOT_HOME_ACCELERATION,
+                        )
+
+                    # On completion publish state / status
+                    self.publish_joint_state()
+                    try:
+                        self.publish_status(
+                            generate_movement_status("HOME", status_type="complete")
+                        )
+                    except Exception:
+                        self.publish_status("at_home_position")
+
+                    print("✅ Home position reached")
+                except Exception as e:
+                    print(f"❌ Home move failed: {e}")
+                    self.publish_status(STATUS_FAILED)
+
+            threading.Thread(target=_home_move, daemon=True).start()
+            # Immediately acknowledge command success (movement in progress)
+            return True
         except Exception:
             return False
 
@@ -370,18 +419,6 @@ class SimpleBridge(RobotInterface):
             self.console.print(f"❌ [red]Joint movement failed:[/red] {e}")
             return False
 
-    def execute_tcp_frames(self, frames: list) -> bool:
-        """Execute sequence of TCP frames."""
-        if not self.is_connected or not self.robot_connection:
-            return False
-        try:
-            for frame in frames:
-                if not self.moveL(frame):
-                    return False
-            return True
-        except Exception:
-            return False
-
     def execute_trajectory_msg(self, trajectory: dict) -> bool:
         """Execute ROS joint trajectory."""
         if not self.is_connected or not self.robot_connection:
@@ -438,6 +475,8 @@ class SimpleBridge(RobotInterface):
 
     def execute_task(self, task_name: str, tcps: list = None, trajectory: dict = None) -> bool:
         """Execute a task with a Rich progress bar for all steps (gripper + moves)."""
+        task_start_time = time.time()
+
         task_name_lower = task_name.lower()
         steps = []
         # Determine steps for progress bar
@@ -465,52 +504,62 @@ class SimpleBridge(RobotInterface):
             for i, pt in enumerate(move_points):
                 steps.append((f"Move to point {i+1}", lambda pt=pt: self._move_point(pt, tcps, trajectory)))
             steps.append(("Open gripper", lambda: self.control_gripper("open")))
-        elif "home" in task_name_lower:
-            move_points = []
-            if tcps:
-                move_points = tcps if isinstance(tcps, list) else [tcps]
-            elif trajectory:
-                joint_trajectory = trajectory.get("joint_trajectory", {})
-                points = joint_trajectory.get("points", [])
-                move_points = points
-            for i, pt in enumerate(move_points):
-                steps.append((f"Move to point {i+1}", lambda pt=pt: self._move_point(pt, tcps, trajectory)))
+        elif "gripper" in task_name_lower and "open" in task_name_lower:
+            steps.append(("Open gripper", lambda: self.control_gripper("open")))
+        elif "gripper" in task_name_lower and "close" in task_name_lower:
+            steps.append(("Close gripper", lambda: self.control_gripper("close")))
+        
         else:
-            # Fallback: just try to move
-            if tcps:
-                steps.append(("Move to TCP", lambda: self.execute_tcp_frames(tcps if isinstance(tcps, list) else [tcps])))
-            elif trajectory:
+            # Fallback: only handle joint trajectory
+            if trajectory:
                 steps.append(("Move trajectory", lambda: self.execute_trajectory_msg(trajectory)))
         # Run steps with progress bar
         success = True
         self._in_task_progress = True
         try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TimeRemainingColumn(),
-                console=self.console,
-                refresh_per_second=10
-            ) as progress:
-                task = progress.add_task(f"🤖 {task_name}", total=len(steps))
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TimeElapsedColumn(),
+                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                    TimeRemainingColumn(),
+                    console=self.console,
+                    refresh_per_second=10
+                ) as progress:
+                    task = progress.add_task(f"🤖 {task_name}", total=len(steps))
+                    for i, (desc, fn) in enumerate(steps):
+                        progress.update(task, description=f"{desc}")
+                        step_result = fn()
+                        if not step_result:
+                            self.console.print(f"[red]Step failed: {desc}[/red]")
+                            success = False
+                            break
+                        progress.advance(task)
+                    progress.update(task, completed=len(steps))
+            except LiveError:
+                # Fallback: no live display available, run steps sequentially
                 for i, (desc, fn) in enumerate(steps):
-                    progress.update(task, description=f"{desc}")
+                    self.console.print(f"🤖 {desc}")
                     step_result = fn()
                     if not step_result:
                         self.console.print(f"[red]Step failed: {desc}[/red]")
                         success = False
                         break
-                    progress.advance(task)
-                progress.update(task, completed=len(steps))
         finally:
             self._in_task_progress = False
         # Publish status if successful
         if success and task_name:
-            success_status = generate_task_status(task_name, status_type="SUCCESS")
-            self.publish_status(success_status)
-            self.console.print(f"✅ [TASK SUCCESS] {success_status}")
+            self.publish_status(STATUS_SUCCESS)
+            self.console.print(f"✅ [TASK SUCCESS] {STATUS_SUCCESS}")
+        if not success:
+            self.publish_status(STATUS_FAILED)
+            self.console.print(f"❌ [TASK FAILED] {STATUS_FAILED}")
+
+        # --- Timing end & report ---
+        elapsed = time.time() - task_start_time
+        self.console.print(f"⏱️  Task '{task_name}' finished in {elapsed:.2f} seconds")
         return success
 
     def _move_point(self, pt, tcps, trajectory):
@@ -538,6 +587,7 @@ class SimpleBridge(RobotInterface):
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
+            TimeElapsedColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TimeRemainingColumn(),
             console=self.console,
@@ -640,7 +690,7 @@ def main():
     
     # Connect to ROS
     try:
-        client = roslibpy.Ros(host='localhost', port=9090)
+        client = roslibpy.Ros(host=ROS_HOST, port=9090)
         client.run()
         console.print("✅ [green]Connected to ROS bridge[/green]")
     except Exception as e:
@@ -649,21 +699,20 @@ def main():
     
     # Create simple bridge
     try:
-        bridge = SimpleBridge("TestBridge", client)
+        bridge = SimpleBridge("UR10", client)
         console.print("✅ [green]Simple bridge created[/green]")
         
         # Create info panel
         info_panel = Panel.fit(
             "[bold cyan]🎯 Simple Bridge Active[/bold cyan] - Listening for ROS messages...\n\n"
             "[bold]Topics:[/bold]\n"
-            "   • [blue]Task Topic:[/blue] /UR10/task/execute\n"
-            "   • [blue]Command Topic:[/blue] /UR10/command\n"
-            "   • [blue]Status Topic:[/blue] /Robot/status/physical\n"
-            "   • [blue]Position Topic:[/blue] /UR10/set_position\n\n"
+            f"   • [blue]Task Topic:[/blue] {TASK_EXECUTE_TOPIC}\n"
+            f"   • [blue]Command Topic:[/blue] {COMMAND_TOPIC}\n"
+            f"   • [blue]Status Topic:[/blue] {STATUS_TOPIC}\n"
+            f"   • [blue]Position Topic:[/blue] {POSITION_TOPIC}\n\n"
             "[bold]📋 Available Commands:[/bold]\n"
             "   • [green]START_FABRICATION[/green] - Start fabrication mode\n"
-            "   • [red]END_FABRICATION[/red] - End fabrication mode\n"
-            "   • [yellow]home[/yellow] - Move to home position\n\n"
+            "   • [red]END_FABRICATION[/red] - End fabrication mode\n\n"
             "[dim]Press Ctrl+C to exit[/dim]",
             title="[bold green]Bridge Status[/bold green]",
             border_style="green"

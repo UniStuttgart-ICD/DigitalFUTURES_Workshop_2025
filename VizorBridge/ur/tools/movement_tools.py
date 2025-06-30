@@ -49,11 +49,12 @@ def move_relative_xyz(dx_m: float, dy_m: float, dz_m: float, wake_phrase: str = 
         dx_m: Relative distance in X direction (meters)
         dy_m: Relative distance in Y direction (meters)
         dz_m: Relative distance in Z direction (meters)
-        wake_phrase: Must contain the wake word 'timbra' for safety
+        wake_phrase: Must contain the wake word 'mave' for safety
     
     Returns:
         Dictionary with status and TCP pose information [x, y, z, rx, ry, rz]
     """
+    print(f"[ALERT] Running move_relative_xyz tool")
     # Send immediate acknowledgment
     send_immediate_response(f"move ({dx_m}, {dy_m}, {dz_m})m relative {wake_phrase}")
     
@@ -66,8 +67,8 @@ def move_relative_xyz(dx_m: float, dy_m: float, dz_m: float, wake_phrase: str = 
         }
     
     robot = get_robot()
-    # Check robot connection
-    if not robot.is_connected or not getattr(robot, 'rtde_c', None):
+    # Ensure robot connection
+    if not robot.ensure_connected() or not getattr(robot, 'rtde_c', None):
         return {"status": "error", "message": "Robot not connected", "pose": None}
     
     # Validate relative move limits
@@ -109,7 +110,7 @@ def move_relative_xyz(dx_m: float, dy_m: float, dz_m: float, wake_phrase: str = 
     except Exception as e:
         return {"status": "error", "message": f"Movement failed: {e}", "pose": None}
 
-@tool
+#@tool
 def move_to_absolute_position(x_m: float, y_m: float, z_m: float, wake_phrase: str = "") -> Dict[str, Any]:
     """Move the robot TCP to an absolute pose in Cartesian space.
     
@@ -117,11 +118,13 @@ def move_to_absolute_position(x_m: float, y_m: float, z_m: float, wake_phrase: s
         x_m: Target TCP X position in meters
         y_m: Target TCP Y position in meters
         z_m: Target TCP Z position in meters
-        wake_phrase: Must contain the wake word 'timbra' for safety
+        wake_phrase: Must contain the wake word 'mave' for safety
     
     Returns:
         Dictionary with status and TCP pose information [x, y, z, rx, ry, rz]
     """
+    print(f"[ALERT] Running move_to_absolute_position tool")
+    
     # Send immediate acknowledgment
     send_immediate_response(f"move to absolute position ({x_m}, {y_m}, {z_m})m {wake_phrase}")
     
@@ -134,7 +137,8 @@ def move_to_absolute_position(x_m: float, y_m: float, z_m: float, wake_phrase: s
         }
     
     robot = get_robot()
-    if not robot.is_connected or not getattr(robot, 'rtde_c', None):
+    # Ensure robot connection
+    if not robot.ensure_connected() or not getattr(robot, 'rtde_c', None):
         return {"status": "error", "message": "Robot not connected", "pose": None}
     
     # Validate absolute reach limits
@@ -169,11 +173,12 @@ def move_home(wake_phrase: str = "") -> Dict[str, Any]:
     """Send the robot to its predefined home position using joint movement.
     
     Args:
-        wake_phrase: Must contain the wake word 'timbra' for safety
+        wake_phrase: Must contain the wake word 'mave' for safety
     
     Returns:
         Dictionary with status information
     """
+    print(f"[ALERT] Running move_home tool")
     # Send immediate acknowledgment
     send_immediate_response(f"checking position and moving home {wake_phrase}")
     
@@ -223,6 +228,7 @@ def get_robot_state() -> Dict[str, Any]:
     Returns:
         Dictionary with robot state information including home position status
     """
+    print(f"[ALERT] Running get_robot_state tool")
     # Send immediate acknowledgment
     send_immediate_response("robot status check")
     
@@ -247,16 +253,18 @@ def stop_robot(wake_phrase: str = "") -> Dict[str, Any]:
     """Emergency stop all robot movements and halt execution.
     
     Args:
-        wake_phrase: Must contain the wake word 'timbra' for safety
+        wake_phrase: Must contain the wake word 'mave' for safety
     
     Returns:
         Dictionary with stop operation status
     """
+    print(f"[ALERT] Running stop_robot tool")
     # Emergency stop doesn't need wake word validation - safety first!
     send_immediate_response(f"EMERGENCY STOP {wake_phrase}")
     
     robot = get_robot()
-    if not robot.is_connected or not getattr(robot, 'rtde_c', None):
+    # Ensure robot connection
+    if not robot.ensure_connected() or not getattr(robot, 'rtde_c', None):
         return {"status": "error", "message": "Robot not connected - cannot send stop command", "stopped": False}
     
     try:

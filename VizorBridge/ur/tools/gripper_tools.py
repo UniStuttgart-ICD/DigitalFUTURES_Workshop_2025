@@ -18,7 +18,7 @@ from ur.config.robot_config import (
     GRIPPER_IO_TYPE,
     WAKEWORD
 )
-from ur.config.system_config import generate_gripper_status, generate_supply_status, generate_movement_status
+from ur.config.system_config import generate_gripper_status, generate_supply_status, generate_movement_status, STATUS_SUCCESS
 import time
 from ur.utils import validate_wakeword, send_immediate_response
 
@@ -48,15 +48,16 @@ def control_gripper(action: str, wake_phrase: str = "") -> Dict[str, Any]:
     
     Args:
         action: Action to perform ('open' or 'close')
-        wake_phrase: Safety wake phrase (must contain 'timbra')
+        wake_phrase: Safety wake phrase (must contain 'mave')
     
     Returns:
         Dict with operation result
     """
+    print(f"[ALERT] Running control_gripper tool")
     if not validate_wakeword(wake_phrase):
         return {
             "success": False,
-            "message": f"I'd love to {action} the gripper, but you forgot to say 'timbra'. Safety protocols!",
+            "message": f"I'd love to {action} the gripper, but you forgot to say 'mave'. Safety protocols!",
             "action": "wakeword_required"
         }
     
@@ -120,21 +121,22 @@ def control_gripper(action: str, wake_phrase: str = "") -> Dict[str, Any]:
             "error": str(e)
         }
 
-@tool
+#@tool
 def get_supply_element(element_length: str, wake_phrase: str = "") -> Dict[str, Any]:
     """Get element from supply station based on length
     
     Args:
         element_length: Length of element to retrieve (e.g., '40cm', '50cm')
-        wake_phrase: Safety wake phrase (must contain 'timbra')
+        wake_phrase: Safety wake phrase (must contain 'mave')
     
     Returns:
         Dict with operation result
     """
+    print(f"[ALERT] Running get_supply_element tool")
     if not validate_wakeword(wake_phrase):
         return {
             "success": False,
-            "message": f"I'd love to get the {element_length} element, but you forgot to say 'timbra'. Safety first!",
+            "message": f"I'd love to get the {element_length} element, but you forgot to say 'mave'. Safety first!",
             "action": "wakeword_required"
         }
     
@@ -178,7 +180,7 @@ def get_supply_element(element_length: str, wake_phrase: str = "") -> Dict[str, 
             "error": str(e)
         }
 
-@tool
+#@tool
 def place_element_at_position(x: float, y: float, z: float, wake_phrase: str = "") -> Dict[str, Any]:
     """Place currently held element at specified position
     
@@ -186,15 +188,16 @@ def place_element_at_position(x: float, y: float, z: float, wake_phrase: str = "
         x: X coordinate in meters for element placement
         y: Y coordinate in meters for element placement  
         z: Z coordinate in meters for element placement
-        wake_phrase: Safety wake phrase (must contain 'timbra')
+        wake_phrase: Safety wake phrase (must contain 'mave')
     
     Returns:
         Dict with operation result
     """
+    print(f"[ALERT] Running place_element_at_position tool")
     if not validate_wakeword(wake_phrase):
         return {
             "success": False,
-            "message": f"I'd love to place the element, but you forgot to say 'timbra'. Safety protocols!",
+            "message": f"I'd love to place the element, but you forgot to say 'mave'. Safety protocols!",
             "action": "wakeword_required"
         }
     
@@ -235,53 +238,33 @@ def place_element_at_position(x: float, y: float, z: float, wake_phrase: str = "
         }
 
 @tool
-def release_element(wake_phrase: str = "") -> Dict[str, Any]:
-    """Release currently held element and return to safe position
-    
+def confirm_task(wake_phrase: str = "") -> Dict[str, Any]:
+    """
+    Confirm the current task. Requires the wake-word 'mave' to publish success status.
+
     Args:
-        wake_phrase: Safety wake phrase (must contain 'timbra')
-    
+        wake_phrase: Safety wake phrase (must contain 'mave')
+
     Returns:
         Dict with operation result
     """
+    print(f"[ALERT] Running confirm_task tool")
+    # Immediate acknowledgment
+    send_immediate_response(f"confirm task {wake_phrase}")
+
+    # Wake word validation
     if not validate_wakeword(wake_phrase):
         return {
             "success": False,
-            "message": "I'd love to release the element, but you forgot to say 'timbra'. Safety protocols!",
+            "message": f"Wake word '{WAKEWORD}' required for task confirmation",
             "action": "wakeword_required"
         }
-    
-    try:
-        send_immediate_response("releasing element and returning to safe position")
-        
-        # Publish gripper open status for release
-        gripper_open_status = generate_gripper_status("OPEN", "PROGRESS")
-        _publish_status_if_bridge_available(gripper_open_status)
-        
-        # Placeholder implementation
-        console.print(f"[cyan]🤖[/cyan] Opening gripper to release element")
-        console.print(f"[cyan]🤖[/cyan] Moving to safe position")
-        
-        # Publish gripper completion and element release
-        gripper_complete_status = generate_gripper_status("OPEN", "COMPLETE")
-        _publish_status_if_bridge_available(gripper_complete_status)
-        
-        message = "Element released! *satisfied mechanical sigh* Another successful operation."
-        console.print(f"[green]✓[/green] {message}")
-        
-        return {
-            "success": True,
-            "message": message,
-            "action": "element_released",
-            "holding": False,
-            "wake_phrase_validated": True
-        }
-        
-    except Exception as e:
-        error_msg = f"Error releasing element: {str(e)}"
-        console.print(f"[red]✗[/red] {error_msg}")
-        return {
-            "success": False,
-            "message": f"Release operation failed! {error_msg}",
-            "error": str(e)
-        }
+
+    # Publish success status via bridge
+    _publish_status_if_bridge_available(STATUS_SUCCESS)
+
+    return {
+        "success": True,
+        "message": "Task confirmed. Success status published.",
+        "action": "task_confirmed"
+    }
