@@ -6,13 +6,21 @@ import sys
 #from sensor.ForceSensor import LoacellSensor
 from ur.launcher import URVoiceSystem
 # from kuka.bridge import KUKAVarProxy
+from ur.config.topics import ROS_HOST, ROS_PORT
 
 # KUKA_REMOTE_HOST = '192.168.2.3' 
 
 def run_fabrication_system():
     """Run the fabrication system with clean restart capability."""
     # ros client
-    client = roslibpy.Ros(host= "127.0.0.1", port=9090)
+    
+    print("--------------------------------")
+    print("Starting UR VizorBridge")
+    
+    print("Starting ROS connection...")
+    print(f"Connecting to ROS: ROS_HOST: {ROS_HOST}, ROS_PORT: {ROS_PORT}")
+    
+    client = roslibpy.Ros(host= ROS_HOST, port=ROS_PORT)
     
     try:
         client.run()
@@ -75,7 +83,28 @@ def run_fabrication_system():
         # Disconnect ROS client if connected
         if client.is_connected:
             client.terminate()
+        
+        # Force cleanup of any remaining threads
+        import threading
+        import sys
+        
         print("✅ Cleanup complete")
+        
+        # Give threads a moment to cleanup
+        time.sleep(0.5)
+        
+        # Force terminate any daemon threads
+        for thread in threading.enumerate():
+            if thread != threading.current_thread() and thread.daemon:
+                print(f"⚠️ Daemon thread still active: {thread.name}")
+        
+        # Force exit if threads are still hanging
+        active_count = threading.active_count()
+        if active_count > 1:  # More than just main thread
+            print(f"⚠️ {active_count} threads still active, forcing exit...")
+            os._exit(0)  # Force exit without cleanup
+        else:
+            sys.exit(0)  # Normal exit
 
 if __name__ == '__main__':
     # Main loop with restart capability

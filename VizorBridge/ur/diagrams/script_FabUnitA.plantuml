@@ -1,0 +1,120 @@
+@startuml
+'────────────────  GLOBAL STYLE  ──────────────────────
+skinparam ParticipantFontColor black
+skinparam note {
+    BackgroundColor #LightYellow
+    BorderColor #Black
+}
+participant "User"                  as User #DDDDDD
+participant "HRC agent"             as HRC  #CCEEFF
+participant "UR10 Robot\n(s2s agent)" as R    #FFDAB9
+
+'────────────────  TITLE  ─────────────────────────────
+title HRC ↔ UR10 ↔ User - Detailed Task-Based Assembly
+
+'────────────────  LEGEND  ────────────────────────────
+legend left
+  <b><color:DarkGreen>/UR10/task/execute</color></b>    GeneralTask (from HRC)
+  <b><color:Purple>/UR10/command</color></b>        String (from HRC)
+  <b><color:Red>/Robot/status/physical</color></b>           String (from Robot)
+  <b><color:Teal>/UR10/set_position</color></b>        JointState (from Robot, https://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/JointState.html)
+endlegend
+
+'────────────────  TRIAGE & ACTIVATION  ────────────────────────────
+== Triage ==
+User -> HRC : "Ah ok. Let's build this"
+HRC  -> User: "Do you want the robot to help?"
+User -> HRC : "Yes"
+
+HRC -[#Purple]-> R : <b><color:Purple>/UR10/command "START_FABRICATION"</color></b>
+hnote over of HRC: Generates task sequence and passes control to Robot.
+R   -[#Red]->    HRC: <b><color:Red>/Robot/status/physical "FABRICATION_STARTED"</color></b>
+R -> User : "<<WAKEWORD>> online! Say '<<WAKEWORD>>' before movement commands. Ready to build!"
+
+
+'────────────────  ONE-TIME SETUP TASKS  ────────────────────────────
+== One-Time Setup ==
+
+'-- Task: Check Elements --
+HRC -[#DarkGreen]-> R : <b><color:DarkGreen>/UR10/task/execute</color></b>\nCheckElements
+R -> User : "I need 40cm, 50cm, and 30cm elements. Are they ready?"
+hnote over User: [retrieves the elements and places them in the beam table]
+User -> R : "Yes I do"
+R -[#Red]-> HRC: <b><color:Red>/Robot/status/physical "SUCCESS_CheckElements"</color></b>
+
+'-- Task: Manual Placement of First Two Elements --
+HRC -[#DarkGreen]-> R : <b><color:DarkGreen>/UR10/task/execute</color></b>\nManualPlacement_FirstTwo
+R -> User : "Please place the first two elements manually. Let me know when done."
+hnote over User: [places the first two elements according to AR guide]
+User -> R : "Ok I'm done."
+R -[#Red]-> HRC: <b><color:Red>/Robot/status/physical "SUCCESS_ManualPlacement_FirstTwo"</color></b>
+
+
+'────────────────  MAIN ASSEMBLY CYCLE (Example: 40cm Beam)  ───────────────────────
+loop "For each beam\n(40 cm, 50 cm, 30 cm)"
+
+    == Beam Assembly: 40 cm ==
+
+    '────────  TASK 1 – Pick-up beam  ────────
+    group Pick-up Beam
+      HRC -[#DarkGreen]-> R : <b><color:DarkGreen>/UR10/task/execute</color></b>\nPickUp_40
+      R -> User: "Please place the 40cm beam on the supply station."
+      hnote over User: [places the element on supply station]
+      User -> R : "Yes it's there."
+      R -> User: "Moving to pick up beam."
+
+      hnote over R: Robot executes sequence: move, grip, lift.
+      R -[#Red]-> HRC: <b><color:Red>/Robot/status/physical "MOVING_TO_SUPPLY"</color></b>
+      R -[#Teal]-> HRC : <b><color:Teal>/UR10/set_position</color></b>
+      R -[#Red]-> HRC: <b><color:Red>/Robot/status/physical "GRIPPER_OPEN"</color></b>
+      R -[#Red]-> HRC: <b><color:Red>/Robot/status/physical "GRIPPER_CLOSE"</color></b>
+      R -[#Teal]-> HRC : <b><color:Teal>/UR10/set_position</color></b>
+      R -[#Red]-> HRC : <b><color:Red>/Robot/status/physical "SUCCESS_PickUp_40"</color></b>
+    end
+
+    '────────  TASK 2 – Place-and/or-Hold beam  ────────
+    group Place-and/or-Hold beam
+        HRC -[#DarkGreen]-> R : <b><color:DarkGreen>/UR10/task/execute</color></b>\nPlaceHold_40
+        R -> User: "Moving to assembly position."
+        hnote over R: Robot moves beam to assembly point.
+        R -[#Teal]-> HRC : <b><color:Teal>/UR10/set_position</color></b>
+        R -[#Red]-> HRC : <b><color:Red>/Robot/status/physical "AT_ASSEMBLY"</color></b>
+        R -> User: "Beam in position. I'll hold steady while you secure the screws."
+        alt Beam position needs to be adjusted
+            User -> R: "I need to adjust the beam position, move it to the right 100mm"
+            R -> User: "I need that <<WAKEWORD>> before I can move it."
+            User -> R: "Ok <<WAKEWORD>>, move it to the right 100mm"
+            R -> User: "Adjusting position to the right."
+            R -[#Teal]-> HRC : <b><color:Teal>/UR10/set_position</color></b>
+            R -[#Red]-> HRC : <b><color:Red>/Robot/status/physical "COMPLETE_ADJUST_POSITION"</color></b>
+            R -> User: "Beam in position. I'll hold steady while you secure the screws."
+        else Beam position is correct
+            hnote over User: [inserts the screws]
+            User -> R : "Alright I'm done"
+            R -[#Red]-> HRC : <b><color:Red>/Robot/status/physical "SUCCESS_PlaceHold_40"</color></b>
+        end
+
+    end
+' place beam
+    '────────  TASK 3 – Return-Home  ────────
+    group Return-Home
+        HRC -[#DarkGreen]-> R : <b><color:DarkGreen>/UR10/task/execute</color></b>\nReturnHome_40
+        hnote over R: Robot releases gripper and heads home with style.
+        R -> User: "Beam secured. I'm returning to the home position."
+        R -[#Red]-> HRC : <b><color:Red>/Robot/status/physical "GRIPPER_OPEN"</color></b>
+        R -[#Teal]-> HRC : <b><color:Teal>/UR10/set_position</color></b>
+        R -[#Red]-> HRC : <b><color:Red>/Robot/status/physical "SUCCESS_ReturnHome_40"</color></b>
+    end
+
+end
+
+'──────────────  END FABRICATION  ─────────────────────
+== Shutdown ==
+hnote across: "Loop repeats for 50cm and 30cm beams. Once all tasks are complete..."
+HRC -[#Purple]-> R  : <b><color:Purple>/UR10/command "END_FABRICATION"</color></b>
+R -> User: "Fabrication complete! All beams are assembled."
+R   -[#Red]->    HRC: <b><color:Red>/Robot/status/physical "FABRICATION_COMPLETE"</color></b>
+R -> User: "Thanks for the collaboration! I'm going offline now."
+hnote across: "Process ends, returns to Triage state."
+
+@enduml

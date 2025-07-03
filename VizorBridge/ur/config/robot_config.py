@@ -7,7 +7,7 @@ Configuration settings for UR robot control.
 
 # Environment switch
 # Set this to True to use the real robot settings, False for simulation
-USE_REAL_ROBOT = True
+USE_REAL_ROBOT = False
 
 # Robot connection
 if USE_REAL_ROBOT:

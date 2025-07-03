@@ -1,0 +1,115 @@
+@startuml
+title Voice Agent Hybrid I/O (OpenAI Realtime WebSocket) - Enhanced Architecture
+
+actor User
+
+participant "Microphone" as Mic
+participant "Text Input UI" as TextUI
+participant "VoiceSessionManager" as SessionMgr
+participant "RealtimeSession" as Session
+participant "OpenAIVoiceAgent" as VoiceAgent
+participant "URBridge" as Bridge
+participant "OpenAI Realtime API" as Realtime
+participant "Headphones" as Headphones
+participant "VoiceAgentStatus" as UI
+participant "SileroVAD" as VAD
+
+== Session Initialization ==
+SessionMgr -> Session: create_session(openai_realtime)
+Session -> VoiceAgent: OpenAIVoiceAgent(bridge_ref, config)
+VoiceAgent -> Session: RealtimeSession(agent, api_key, bridge_ref)
+Session -> Realtime: connect() with session config
+Realtime --> Session: session.created
+Session -> UI: display "Connected to OpenAI"
+
+== Enhanced Speech Input Flow ==
+User -> Mic: speak command
+Mic -> Session: _audio_input_stream_impl()
+Session -> VAD: process_audio_chunk(audio_array)
+VAD --> Session: speech_detected=true
+Session -> Session: encode_audio_for_openai(audio_bytes)
+Session -> Realtime: input_audio_buffer.append(audio_base64)
+Realtime --> Session: input_audio_buffer.speech_started
+Session -> VoiceAgent: _emit_event(SPEECH_STARTED)
+VAD --> Session: speech_ended=true
+Session -> Session: flush_audio_buffer()
+Session -> Realtime: input_audio_buffer.commit
+Realtime --> Session: input_audio_buffer.speech_stopped
+Realtime --> Session: conversation.item.input_audio_transcription.completed
+Session -> VoiceAgent: _emit_event(TRANSCRIPTION_COMPLETED)
+VoiceAgent -> Bridge: _notify_agent_sync('transcript_received', data)
+Session -> UI: display recognized text
+
+== Hybrid Text Input Flow ==
+User -> TextUI: type text command
+TextUI -> Session: send_message(text)
+Session -> Realtime: conversation.item.create(user_message)
+Session -> Realtime: response.create()
+Realtime --> Session: response.created
+Session -> VoiceAgent: _emit_event(RESPONSE_STARTED)
+VoiceAgent -> Bridge: _notify_agent_sync('command_received', data)
+Session -> UI: display entered text
+
+== Context Injection Flow (NEW) ==
+Bridge -> Bridge: execute_task_with_commentary(...)
+Bridge -> SessionMgr: inject_context('task_starting', event_data)
+SessionMgr -> VoiceAgent: inject_context_into_session(event_type, data)
+VoiceAgent -> Session: send_message(context_message)
+Session -> Realtime: conversation.item.create(context_update)
+
+== Enhanced Tool Execution Flow ==
+Realtime --> Session: response.output_item.done (function_call)
+Session -> Session: _handle_tool_call(event)
+Session -> Session: _execute_tool(tool, args)
+alt threaded execution enabled
+  Session -> Session: run_in_executor(tool.execute, args)
+else synchronous execution
+  Session -> Session: tool.execute(args)
+end
+Session -> Bridge: execute via registered tools
+Bridge -> Bridge: perform robot action
+Bridge -> Bridge: _notify_agent_sync('robot_action', data)
+Session -> Realtime: conversation.item.create(function_call_output)
+Session -> Realtime: response.create()
+
+== Task Execution & Enhanced Commentary ==
+Bridge -> Bridge: handle_task(msg)
+Bridge -> Bridge: execute_task_with_commentary(...)
+Bridge -> VoiceAgent: handle_task_event('task_starting', data)
+VoiceAgent -> VoiceAgent: _generate_robot_action_commentary(data)
+VoiceAgent -> Session: send_message(commentary_text)
+Session -> Realtime: conversation.item.create(commentary_text)
+Session -> Realtime: response.create()
+alt audio response enabled
+  Realtime --> Session: response.audio.delta (audio_chunk)
+  Session -> Session: _play_audio_response(audio_chunk)
+  Session -> Session: _mute_microphone()
+  Session -> Headphones: play_audio(normalized_audio)
+  Session -> Session: _unmute_microphone()
+else text response
+  Realtime --> Session: response.text.delta (text_chunk)
+  Session -> UI: display_text(text_chunk)
+end
+Bridge -> Bridge: _notify_agent_sync('task_completed', data)
+Bridge -> VoiceAgent: handle_task_event('task_completed', data)
+
+== Enhanced Audio Processing ==
+note over Session, VAD
+  Enhanced audio pipeline:
+  1. Silero VAD for accurate speech detection
+  2. encode_audio_for_openai() conversion
+  3. Feedback prevention during playback
+  4. Threaded tool execution
+  5. Context-aware responses
+end note
+
+== Session Management ==
+note over SessionMgr
+  VoiceSessionManager handles:
+  - Multiple session types (OpenAI, SmolAgent)
+  - Session lifecycle (create, start, stop, cleanup)
+  - Context injection across sessions
+  - Session state tracking
+end note
+
+@enduml 
